@@ -3,7 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const rateLimit = require('express-rate-limit');
+// const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const compression = require('compression');
 const cookieParser = require('cookie-parser');
@@ -12,9 +12,6 @@ const { db, initDatabase, cleanupLoginAttempts, cleanupOldLogs } = require('./da
 const app = express();
 const PORT = parseInt(process.env.PORT) || 9191;
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
-const MAX_LOGIN_ATTEMPTS = 5;
-const LOGIN_WINDOW_MINUTES = 15;
-const LOCKOUT_MINUTES = 30;
 
 // ============== Middleware ==============
 app.use(helmet({
@@ -26,27 +23,6 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(cookieParser());
 
-// Global rate limiter
-const globalLimiter = rateLimit({
-    windowMs: 1 * 60 * 1000,
-    max: 200,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: '请求过于频繁，请稍后再试' }
-});
-app.use('/api/', globalLimiter);
-
-// Strict login rate limiter (brute force protection)
-const loginLimiter = rateLimit({
-    windowMs: LOGIN_WINDOW_MINUTES * 60 * 1000,
-    max: MAX_LOGIN_ATTEMPTS,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: `登录尝试过多，请 ${LOGIN_WINDOW_MINUTES} 分钟后再试` },
-    keyGenerator: (req) => {
-        return req.ip + ':' + (req.body.username || 'unknown');
-    }
-});
 
 // Serve static files (no cache for HTML, allow cache for assets)
 app.use(express.static(path.join(__dirname, 'public'), {
@@ -195,7 +171,7 @@ function recordLoginAttempt(ip, username, success) {
 }
 
 // ============== Auth Routes ==============
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) {
         return res.status(400).json({ error: '请输入用户名和密码' });
@@ -208,7 +184,7 @@ app.post('/api/auth/login', (req, res) => {
         return res.status(401).json({ error: '用户名或密码错误' });
     }
 
-    const valid = bcrypt.compareSync(password, user.password_hash);
+    const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
         return res.status(401).json({ error: '用户名或密码错误' });
     }
@@ -226,13 +202,7 @@ app.get('/api/auth/me', authenticateAdmin, (req, res) => {
 });
 
 // ============== User Registration & Login ==============
-const userRegisterLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, // 1 hour
-    max: 10,
-    message: { error: '注册过于频繁，请稍后再试' }
-});
-
-app.post('/api/user/register', userRegisterLimiter, (req, res) => {
+app.post('/api/user/register', async (req, res) => {
     try {
         const { username, password } = req.body;
         if (!username || !password) {
@@ -254,7 +224,7 @@ app.post('/api/user/register', userRegisterLimiter, (req, res) => {
             return res.status(409).json({ error: '用户名已存在' });
         }
 
-        const hash = bcrypt.hashSync(password, 12);
+        const hash = await bcrypt.hash(password, 12);
         const result = db.prepare(
             'INSERT INTO users (username, password_hash, download_credits) VALUES (?, ?, 1)'
         ).run(username, hash);
@@ -269,7 +239,7 @@ app.post('/api/user/register', userRegisterLimiter, (req, res) => {
     }
 });
 
-app.post('/api/user/login', (req, res) => {
+app.post('/api/user/login', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) {
         return res.status(400).json({ error: '请输入用户名和密码' });
@@ -282,7 +252,7 @@ app.post('/api/user/login', (req, res) => {
         return res.status(401).json({ error: '用户名或密码错误' });
     }
 
-    const valid = bcrypt.compareSync(password, user.password_hash);
+    const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) {
         return res.status(401).json({ error: '用户名或密码错误' });
     }
@@ -326,26 +296,35 @@ app.get('/api/cards', optionalUserAuth, (req, res) => {
         const sortField = req.query.sort === 'hot' ? 'likes_count' : 'created_at';
         const userId = req.user?.id ?? req.admin?.id ?? null;
         const cards = db.prepare(
-            `SELECT cc.id, cc.name, cc.description, cc.avatar_url, cc.data, cc.creator_notes,
+            `SELECT cc.id, cc.name, cc.description, cc.avatar_url, cc.creator_notes,
                     cc.downloads_count, cc.uploader_user_id, cc.created_at, cc.likes_count,
                     CASE WHEN cl.id IS NOT NULL THEN 1 ELSE 0 END AS user_liked
              FROM character_cards cc
              LEFT JOIN card_likes cl ON cl.card_id = cc.id AND cl.user_id = ?
              ORDER BY cc.${sortField} DESC`
         ).all(userId);
-        // Parse data field back to JSON for client
-        const result = cards.map(c => {
-            try {
-                c.data = c.data ? JSON.parse(c.data) : null;
-            } catch (e) {
-                c.data = null;
-            }
-            return c;
-        });
-        res.json(result);
+        res.json(cards);
     } catch (err) {
         console.error('Fetch cards error:', err);
         res.status(500).json({ error: '获取卡片失败' });
+    }
+});
+
+app.get('/api/cards/:id', optionalUserAuth, (req, res) => {
+    try {
+        const userId = req.user?.id ?? req.admin?.id ?? null;
+        const card = db.prepare(
+            `SELECT cc.*, CASE WHEN cl.id IS NOT NULL THEN 1 ELSE 0 END AS user_liked
+             FROM character_cards cc
+             LEFT JOIN card_likes cl ON cl.card_id = cc.id AND cl.user_id = ?
+             WHERE cc.id = ?`
+        ).get(userId, req.params.id);
+        if (!card) return res.status(404).json({ error: '卡片不存在' });
+        try { card.data = card.data ? JSON.parse(card.data) : null; } catch (e) { card.data = null; }
+        res.json(card);
+    } catch (err) {
+        console.error('Fetch card detail error:', err);
+        res.status(500).json({ error: '获取卡片详情失败' });
     }
 });
 
@@ -854,7 +833,7 @@ app.put('/api/admin/settings', authenticateAdmin, (req, res) => {
     }
 });
 
-app.put('/api/admin/password', authenticateAdmin, (req, res) => {
+app.put('/api/admin/password', authenticateAdmin, async (req, res) => {
     try {
         const { currentPassword, newPassword } = req.body;
         if (!currentPassword || !newPassword) {
@@ -864,10 +843,10 @@ app.put('/api/admin/password', authenticateAdmin, (req, res) => {
             return res.status(400).json({ error: '新密码长度至少6位' });
         }
         const user = db.prepare('SELECT * FROM admin_users WHERE id = ?').get(req.admin.id);
-        if (!user || !bcrypt.compareSync(currentPassword, user.password_hash)) {
+        if (!user || !(await bcrypt.compare(currentPassword, user.password_hash))) {
             return res.status(401).json({ error: '当前密码错误' });
         }
-        const hash = bcrypt.hashSync(newPassword, 12);
+        const hash = await bcrypt.hash(newPassword, 12);
         db.prepare('UPDATE admin_users SET password_hash = ? WHERE id = ?').run(hash, user.id);
         res.json({ success: true });
     } catch (err) {
@@ -924,9 +903,7 @@ app.get('/api/admin/users', authenticateAdmin, (req, res) => {
 });
 
 // ============== Visit Tracking ==============
-const visitTrackLimiter = rateLimit({ windowMs: 60000, max: 30, message: { error: 'Too many requests' } });
-
-app.post('/api/track/visit', visitTrackLimiter, (req, res) => {
+app.post('/api/track/visit', (req, res) => {
     try {
         const visitPath = req.body.path || '/';
         const ip = req.ip;
