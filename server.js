@@ -296,7 +296,7 @@ app.get('/api/cards', optionalUserAuth, (req, res) => {
         const sortField = req.query.sort === 'hot' ? 'likes_count' : 'created_at';
         const userId = req.user?.id ?? req.admin?.id ?? null;
         const cards = db.prepare(
-            `SELECT cc.id, cc.name, cc.description, cc.avatar_url, cc.creator_notes,
+            `SELECT cc.id, cc.name, cc.description, cc.creator_notes,
                     cc.downloads_count, cc.uploader_user_id, cc.created_at, cc.likes_count,
                     CASE WHEN cl.id IS NOT NULL THEN 1 ELSE 0 END AS user_liked
              FROM character_cards cc
@@ -307,6 +307,26 @@ app.get('/api/cards', optionalUserAuth, (req, res) => {
     } catch (err) {
         console.error('Fetch cards error:', err);
         res.status(500).json({ error: '获取卡片失败' });
+    }
+});
+
+app.get('/api/cards/:id/avatar', (req, res) => {
+    try {
+        const row = db.prepare('SELECT avatar_url FROM character_cards WHERE id = ?').get(req.params.id);
+        if (!row || !row.avatar_url) return res.status(404).end();
+        const dataUrl = row.avatar_url;
+        const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+        if (!match) {
+            // Not a data URL, redirect to the actual URL
+            return res.redirect(dataUrl);
+        }
+        const contentType = match[1];
+        const buffer = Buffer.from(match[2], 'base64');
+        res.set('Content-Type', contentType);
+        res.set('Cache-Control', 'public, max-age=604800, immutable');
+        res.send(buffer);
+    } catch (err) {
+        res.status(500).end();
     }
 });
 
