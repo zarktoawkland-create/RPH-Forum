@@ -326,6 +326,23 @@ function buildPlaceholderSvg(name, seed, width, height, fontSize) {
     </svg>`;
 }
 
+function isCorruptedAvatarUrl(avatarUrl, cardId) {
+    if (!avatarUrl) return false;
+    const normalized = String(avatarUrl).trim();
+    if (!normalized) return false;
+    if (normalized.startsWith('blob:') || normalized.startsWith('file:')) return true;
+    return new RegExp(`/api/cards/${cardId}/(?:avatar|thumbnail)$`, 'i').test(normalized);
+}
+
+function sanitizeAvatarUrl(avatarUrl, cardId) {
+    if (!avatarUrl) return '';
+    const normalized = String(avatarUrl).trim();
+    if (!normalized || isCorruptedAvatarUrl(normalized, cardId)) return '';
+    if (normalized.startsWith('data:')) return normalized;
+    if (/^https?:\/\//i.test(normalized)) return normalized;
+    return '';
+}
+
 function cacheThumbnail(cardId, body, contentType, cacheControl) {
     if (thumbnailCache.size >= THUMBNAIL_MAX_CACHE) {
         const firstKey = thumbnailCache.keys().next().value;
@@ -339,8 +356,10 @@ app.get('/api/cards/:id/avatar', async (req, res) => {
         const row = db.prepare('SELECT avatar_url, name FROM character_cards WHERE id = ?').get(req.params.id);
         if (!row) return res.status(404).end();
 
+        const safeAvatarUrl = sanitizeAvatarUrl(row.avatar_url, req.params.id);
+
         // No avatar data — generate placeholder
-        if (!row.avatar_url) {
+        if (!safeAvatarUrl) {
             const svg = buildPlaceholderSvg(row.name, req.params.id, 800, 1067, 320);
             if (!sharp) {
                 res.set('Content-Type', 'image/svg+xml');
@@ -353,7 +372,7 @@ app.get('/api/cards/:id/avatar', async (req, res) => {
             return res.send(placeholder);
         }
 
-        const dataUrl = row.avatar_url;
+        const dataUrl = safeAvatarUrl;
         const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
         if (!match) {
             // Not a data URL, redirect to the actual URL
@@ -387,9 +406,10 @@ app.get('/api/cards/:id/thumbnail', async (req, res) => {
 
         const row = db.prepare('SELECT avatar_url, name FROM character_cards WHERE id = ?').get(cardId);
         if (!row) return res.status(404).end();
+        const safeAvatarUrl = sanitizeAvatarUrl(row.avatar_url, cardId);
 
         // No avatar data — generate placeholder thumbnail with first character
-        if (!row.avatar_url) {
+        if (!safeAvatarUrl) {
             const svg = buildPlaceholderSvg(row.name, cardId, 400, 533, 160);
             if (!sharp) {
                 res.set('Content-Type', 'image/svg+xml');
@@ -403,7 +423,7 @@ app.get('/api/cards/:id/thumbnail', async (req, res) => {
             return res.send(placeholder);
         }
 
-        const dataUrl = row.avatar_url;
+        const dataUrl = safeAvatarUrl;
         const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
         if (!match) {
             return res.redirect(dataUrl);
@@ -432,13 +452,15 @@ app.get('/api/cards/:id/thumbnail', async (req, res) => {
         // Fallback to full avatar
         try {
             const row = db.prepare('SELECT avatar_url FROM character_cards WHERE id = ?').get(req.params.id);
-            if (row && row.avatar_url) {
-                const m = row.avatar_url.match(/^data:([^;]+);base64,(.+)$/);
+            const safeAvatarUrl = row ? sanitizeAvatarUrl(row.avatar_url, req.params.id) : '';
+            if (safeAvatarUrl) {
+                const m = safeAvatarUrl.match(/^data:([^;]+);base64,(.+)$/);
                 if (m) {
                     res.set('Content-Type', m[1]);
                     res.set('Cache-Control', 'public, max-age=604800');
                     return res.send(Buffer.from(m[2], 'base64'));
                 }
+                return res.redirect(safeAvatarUrl);
             }
         } catch {}
         res.status(500).end();
@@ -483,11 +505,12 @@ app.post('/api/cards', requireUserOrAdmin, (req, res) => {
         const now = new Date().toISOString();
         const dataStr = data ? JSON.stringify(data) : null;
         const uploaderUserId = req.user ? req.user.id : null;
+        const safeAvatarUrl = sanitizeAvatarUrl(avatar_url, id);
 
         try {
             db.prepare(
                 'INSERT INTO character_cards (id, name, description, avatar_url, data, creator_notes, uploader_user_id, data_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-            ).run(id, name, description || '', avatar_url || '', dataStr, creator_notes || '', uploaderUserId, dataHash, now);
+            ).run(id, name, description || '', safeAvatarUrl, dataStr, creator_notes || '', uploaderUserId, dataHash, now);
         } catch (insertErr) {
             if (insertErr.message && insertErr.message.includes('UNIQUE constraint failed')) {
                 const conflict = db.prepare('SELECT name FROM character_cards WHERE data_hash = ?').get(dataHash);
@@ -521,10 +544,17 @@ app.delete('/api/cards/:id', (req, res) => {
         const token = authHeader.split(' ')[1];
         let isAdmin = false;
         let userId = null;
+        let username = '';
         try {
             const decoded = jwt.verify(token, JWT_SECRET);
-            if (decoded.role === 'admin') isAdmin = true;
-            else userId = decoded.userId;
+            if (decoded.role === 'admin') {
+                isAdmin = true;
+                userId = decoded.id;
+                username = decoded.username || '';
+            } else {
+                userId = decoded.id;
+                username = decoded.username || '';
+            }
         } catch {
             return res.status(401).json({ error: '认证失败' });
         }
@@ -536,7 +566,8 @@ app.delete('/api/cards/:id', (req, res) => {
         }
 
         // Only admin or card owner can delete
-        if (!isAdmin && (!userId || card.uploader_user_id !== String(userId))) {
+        const ownerUserId = card.uploader_user_id == null ? null : Number(card.uploader_user_id);
+        if (!isAdmin && (!userId || ownerUserId !== Number(userId))) {
             return res.status(403).json({ error: '无权删除此卡片' });
         }
 
@@ -550,7 +581,7 @@ app.delete('/api/cards/:id', (req, res) => {
         deleteAndReclaim();
         thumbnailCache.delete(id);
 
-        logOperation({ userType: isAdmin ? 'admin' : 'user', userId: isAdmin ? 'admin' : userId, username: isAdmin ? 'admin' : '', action: 'delete', targetType: 'card', targetId: id, ip: req.ip, details: { name: card?.name } });
+        logOperation({ userType: isAdmin ? 'admin' : 'user', userId, username, action: 'delete', targetType: 'card', targetId: id, ip: req.ip, details: { name: card?.name } });
         res.json([{ id }]);
     } catch (err) {
         console.error('Delete card error:', err);
