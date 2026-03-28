@@ -158,7 +158,16 @@
         /* Mobile Bottom Sheet Smoothness */
         .scroll-smooth-mobile {
             -webkit-overflow-scrolling: touch;
-            scroll-behavior: smooth;
+            overscroll-behavior: contain;
+            touch-action: pan-y;
+        }
+
+        .mobile-bg-img {
+            will-change: transform, filter, opacity;
+            transform: translateZ(0);
+            -webkit-backface-visibility: hidden;
+            backface-visibility: hidden;
+            transition: opacity 0.2s ease;
         }
 
         /* Sticky header effect for mobile modal content */
@@ -748,12 +757,11 @@
         </div>
 
         <!-- Preview Modal (Full Screen Mobile Scroll & Parallax) -->
-        <div v-if="selectedCard" class="fixed inset-0 z-50 flex md:items-center justify-center bg-black/60 backdrop-blur-sm animate-fade-in md:p-4 transition-all duration-300">
+        <div v-if="selectedCard" class="fixed inset-0 z-50 flex md:items-center justify-center bg-black/60 animate-fade-in md:p-4 md:backdrop-blur-sm md:transition-all md:duration-300">
             
             <!-- Mobile Container (Parallax Scroll) -->
             <div class="md:hidden w-full h-full relative overflow-y-auto scroll-smooth-mobile no-scrollbar animate-slide-up-mobile"
-                 @scroll="handleMobileScroll"
-                 style="scroll-snap-type: y proximity;">
+                 @scroll="handleMobileScroll">
                 
                 <!-- Close Button -->
                 <button @click="selectedCard = null" class="fixed top-4 right-4 z-50 bg-black/30 text-white p-2.5 rounded-full backdrop-blur-md border border-white/20 active:scale-95 transition-transform">
@@ -761,19 +769,21 @@
                 </button>
 
                 <!-- Fixed Background Image -->
-                <div class="fixed top-0 left-0 w-full h-[80vh] z-0 overflow-hidden bg-gray-100">
+                <div class="fixed top-0 left-0 w-full h-[80vh] z-0 overflow-hidden bg-gray-900">
                     <div class="absolute inset-0 flex items-center justify-center">
                         <div class="animate-spin rounded-full h-8 w-8 border-3 border-white/50 border-t-transparent"></div>
                     </div>
                     <img :src="selectedCard.avatar_url || selectedCard.avatar || defaultAvatar"
-                         class="w-full h-full object-cover object-top transition-all duration-200 ease-out"
-                         :style="{ filter: `blur(${mobileScrollBlur}px)`, transform: `scale(${1 + mobileScrollBlur/150})` }"
-                         @load="$event.target.style.opacity = 1" @error="if (!$event.target.dataset.fallback) { $event.target.dataset.fallback = '1'; $event.target.src = defaultAvatar; $event.target.style.opacity = 1 }" style="opacity: 0">
+                         id="mobile-bg-img"
+                         class="w-full h-full object-cover object-top mobile-bg-img"
+                         @load="$event.target.style.opacity = 1"
+                         @error="if (!$event.target.dataset.fallback) { $event.target.dataset.fallback = 'thumbnail'; $event.target.src = selectedCard.thumbnail_url || defaultAvatar; $event.target.style.opacity = 1 } else if ($event.target.dataset.fallback === 'thumbnail') { $event.target.dataset.fallback = 'default'; $event.target.src = defaultAvatar; $event.target.style.opacity = 1 }"
+                         style="opacity: 0">
                     <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/20"></div>
                 </div>
 
                 <!-- Content Layer (Pushes up content) -->
-                <div class="relative z-10 w-full flex flex-col min-h-screen pt-[62vh]" style="scroll-snap-align: start;">
+                <div class="relative z-10 w-full flex flex-col min-h-screen pt-[62vh]">
                     <div class="flex-1 bg-white rounded-t-[2.5rem] shadow-[0_-10px_40px_rgba(0,0,0,0.2)] px-6 py-4 pb-32 flex flex-col min-h-[80vh]">
                         
                         <!-- Pull Bar & Hint -->
@@ -1199,13 +1209,24 @@
                 const isUploading = ref(false);
                 const selectedCard = ref(null);
                 const toasts = ref([]);
-                const mobileScrollBlur = ref(0);
                 const windowWidth = ref(window.innerWidth);
+                let mobileScrollTicking = false;
 
                 const handleMobileScroll = (e) => {
-                    const scrollTop = e.target.scrollTop;
-                    // 调优：滚动 400px 时达到最大 8px 模糊，变化更缓和
-                    mobileScrollBlur.value = Math.min(8, scrollTop / 50);
+                    if (mobileScrollTicking) return;
+                    mobileScrollTicking = true;
+                    const container = e.target;
+                    requestAnimationFrame(() => {
+                        const scrollTop = container.scrollTop;
+                        const blur = Math.min(6, scrollTop / 70);
+                        const scale = 1 + blur / 180;
+                        const bgImage = document.getElementById('mobile-bg-img');
+                        if (bgImage) {
+                            bgImage.style.filter = blur > 0 ? `blur(${blur}px)` : 'none';
+                            bgImage.style.transform = `scale(${scale}) translateZ(0)`;
+                        }
+                        mobileScrollTicking = false;
+                    });
                 };
 
                 const handleWindowResize = () => {
@@ -2032,7 +2053,13 @@
                 };
 
                 const previewCard = async (card) => {
-                    mobileScrollBlur.value = 0; // 重置模糊值
+                    const bgImage = document.getElementById('mobile-bg-img');
+                    if (bgImage) {
+                        bgImage.style.opacity = '0';
+                        bgImage.style.filter = 'none';
+                        bgImage.style.transform = 'scale(1) translateZ(0)';
+                        delete bgImage.dataset.fallback;
+                    }
                     
                     // 按需加载完整卡片数据
                     if (!card.data) {
@@ -2758,7 +2785,7 @@
                     showUploadModal, showSearchModal, uploadingCard, isUploading, handleFileSelect, confirmUpload, handleUploadClick,
                     selectedCard, previewCard, formatDate, downloadCard, deleteCard, moveCard,
                     toasts, currentTab, myUploadedIds, popularTags, visiblePopularTags, showPopularTagsToggle, modalPopularTags, searchTag,
-                    mobileScrollBlur, handleMobileScroll,
+                    handleMobileScroll,
                     isAdmin, handleLogoClick, handleAdminLogout, renderMarkdown,
                     showAdminLogin, adminLoginForm, adminLoginError, handleAdminLogin,
                     comments, loadingComments, newComment, submitComment, deleteComment, likeComment, likeCard, replyToComment, cancelReply,
