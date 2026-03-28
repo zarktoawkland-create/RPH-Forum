@@ -5,8 +5,8 @@ WORKDIR /app
 # Install build dependencies for better-sqlite3
 RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 
-COPY package.json ./
-RUN npm install --production && npm install @img/sharp-linux-x64 --no-save
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --include=optional
 
 COPY server.js database.js ./
 COPY public/ ./public/
