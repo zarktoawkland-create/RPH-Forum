@@ -1088,7 +1088,7 @@
         </div>
 
         <!-- User Auth Modal (Login/Register) -->
-        <div v-if="showUserAuthModal" class="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-[100]" @click.self="showUserAuthModal = false">
+        <div v-if="showUserAuthModal" class="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-[100]" @mousedown.self="showUserAuthModal = false">
             <div class="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm mx-4 animate-scale-in">
                 <h3 class="text-lg font-bold text-gray-900 mb-1 text-center">{{ userAuthMode === 'register' ? '注册账号' : '登录' }}</h3>
                 <p class="text-xs text-gray-400 text-center mb-4">{{ userAuthMode === 'register' ? '注册即送 1 次下载机会' : '登录后评论和点赞可获取下载次数' }}</p>
@@ -1128,9 +1128,9 @@
 
         // Safe localStorage wrapper (handles Tracking Prevention blocking)
         const safeStorage = {
-            getItem(key) { try { return safeStorage.getItem(key); } catch(e) { return null; } },
-            setItem(key, val) { try { safeStorage.setItem(key, val); } catch(e) {} },
-            removeItem(key) { try { safeStorage.removeItem(key); } catch(e) {} }
+            getItem(key) { try { return localStorage.getItem(key); } catch(e) { return null; } },
+            setItem(key, val) { try { localStorage.setItem(key, val); } catch(e) {} },
+            removeItem(key) { try { localStorage.removeItem(key); } catch(e) {} }
         };
 
         createApp({
