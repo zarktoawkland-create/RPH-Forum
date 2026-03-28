@@ -136,6 +136,8 @@ function initDatabase() {
     try { db.exec('ALTER TABLE character_cards ADD COLUMN likes_count INTEGER DEFAULT 0'); } catch (e) { /* column exists */ }
     try { db.exec('CREATE INDEX IF NOT EXISTS idx_cards_likes_count ON character_cards(likes_count DESC)'); } catch (e) { /* index exists */ }
     try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_data_hash_unique ON character_cards (data_hash) WHERE data_hash IS NOT NULL'); } catch (e) { /* index exists */ }
+    try { db.exec('ALTER TABLE character_comments ADD COLUMN reply_to_id TEXT'); } catch (e) { /* column exists */ }
+    try { db.exec('ALTER TABLE character_comments ADD COLUMN reply_to_name TEXT'); } catch (e) { /* column exists */ }
 
     // Seed admin user from environment variables
     const adminUsername = process.env.ADMIN_USERNAME || 'admin';
