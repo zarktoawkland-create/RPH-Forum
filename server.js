@@ -7,7 +7,12 @@ const bcrypt = require('bcryptjs');
 const helmet = require('helmet');
 const compression = require('compression');
 const cookieParser = require('cookie-parser');
-const sharp = require('sharp');
+let sharp = null;
+try {
+    sharp = require('sharp');
+} catch (err) {
+    console.warn('[Server] sharp unavailable, image compression disabled:', err.message);
+}
 const { db, initDatabase, cleanupLoginAttempts, cleanupOldLogs } = require('./database');
 
 const app = express();
@@ -309,6 +314,26 @@ app.get('/api/cards', optionalUserAuth, (req, res) => {
     }
 });
 
+function buildPlaceholderSvg(name, seed, width, height, fontSize) {
+    const firstChar = Array.from(((name || '?').trim() || '?'))[0] || '?';
+    const colors = ['#6366f1', '#8b5cf6', '#ec4899', '#f43f5e', '#f97316', '#14b8a6', '#3b82f6', '#10b981'];
+    const key = String(seed || name || '?');
+    const colorIndex = Array.from(key).reduce((sum, char) => sum + char.charCodeAt(0), 0) % colors.length;
+    const color = colors[colorIndex];
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+        <rect width="${width}" height="${height}" fill="${color}"/>
+        <text x="${width / 2}" y="${height / 2 + fontSize * 0.08}" font-size="${fontSize}" fill="white" text-anchor="middle" dominant-baseline="middle" font-family="sans-serif">${firstChar}</text>
+    </svg>`;
+}
+
+function cacheThumbnail(cardId, body, contentType, cacheControl) {
+    if (thumbnailCache.size >= THUMBNAIL_MAX_CACHE) {
+        const firstKey = thumbnailCache.keys().next().value;
+        thumbnailCache.delete(firstKey);
+    }
+    thumbnailCache.set(cardId, { body, contentType, cacheControl });
+}
+
 app.get('/api/cards/:id/avatar', async (req, res) => {
     try {
         const row = db.prepare('SELECT avatar_url, name FROM character_cards WHERE id = ?').get(req.params.id);
@@ -316,13 +341,12 @@ app.get('/api/cards/:id/avatar', async (req, res) => {
 
         // No avatar data — generate placeholder
         if (!row.avatar_url) {
-            const char = (row.name || '?')[0];
-            const colors = ['#6366f1','#8b5cf6','#ec4899','#f43f5e','#f97316','#14b8a6','#3b82f6','#10b981'];
-            const color = colors[req.params.id.charCodeAt(0) % colors.length];
-            const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="800" height="1067">
-                <rect width="800" height="1067" fill="${color}"/>
-                <text x="400" y="560" font-size="320" fill="white" text-anchor="middle" dominant-baseline="middle" font-family="sans-serif">${char}</text>
-            </svg>`;
+            const svg = buildPlaceholderSvg(row.name, req.params.id, 800, 1067, 320);
+            if (!sharp) {
+                res.set('Content-Type', 'image/svg+xml');
+                res.set('Cache-Control', 'public, max-age=86400');
+                return res.send(svg);
+            }
             const placeholder = await sharp(Buffer.from(svg)).png().toBuffer();
             res.set('Content-Type', 'image/png');
             res.set('Cache-Control', 'public, max-age=86400');
@@ -356,9 +380,9 @@ app.get('/api/cards/:id/thumbnail', async (req, res) => {
         // Check memory cache
         if (thumbnailCache.has(cardId)) {
             const cached = thumbnailCache.get(cardId);
-            res.set('Content-Type', 'image/webp');
-            res.set('Cache-Control', 'public, max-age=2592000, immutable');
-            return res.send(cached);
+            res.set('Content-Type', cached.contentType);
+            res.set('Cache-Control', cached.cacheControl);
+            return res.send(cached.body);
         }
 
         const row = db.prepare('SELECT avatar_url, name FROM character_cards WHERE id = ?').get(cardId);
@@ -366,19 +390,14 @@ app.get('/api/cards/:id/thumbnail', async (req, res) => {
 
         // No avatar data — generate placeholder thumbnail with first character
         if (!row.avatar_url) {
-            const char = (row.name || '?')[0];
-            const colors = ['#6366f1','#8b5cf6','#ec4899','#f43f5e','#f97316','#14b8a6','#3b82f6','#10b981'];
-            const color = colors[cardId.charCodeAt(0) % colors.length];
-            const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="533">
-                <rect width="400" height="533" fill="${color}"/>
-                <text x="200" y="290" font-size="160" fill="white" text-anchor="middle" dominant-baseline="middle" font-family="sans-serif">${char}</text>
-            </svg>`;
-            const placeholder = await sharp(Buffer.from(svg)).webp({ quality: 75 }).toBuffer();
-            if (thumbnailCache.size >= THUMBNAIL_MAX_CACHE) {
-                const firstKey = thumbnailCache.keys().next().value;
-                thumbnailCache.delete(firstKey);
+            const svg = buildPlaceholderSvg(row.name, cardId, 400, 533, 160);
+            if (!sharp) {
+                res.set('Content-Type', 'image/svg+xml');
+                res.set('Cache-Control', 'public, max-age=86400');
+                return res.send(svg);
             }
-            thumbnailCache.set(cardId, placeholder);
+            const placeholder = await sharp(Buffer.from(svg)).webp({ quality: 75 }).toBuffer();
+            cacheThumbnail(cardId, placeholder, 'image/webp', 'public, max-age=86400');
             res.set('Content-Type', 'image/webp');
             res.set('Cache-Control', 'public, max-age=86400');
             return res.send(placeholder);
@@ -390,18 +409,20 @@ app.get('/api/cards/:id/thumbnail', async (req, res) => {
             return res.redirect(dataUrl);
         }
 
+        if (!sharp) {
+            const originalBuffer = Buffer.from(match[2], 'base64');
+            res.set('Content-Type', match[1]);
+            res.set('Cache-Control', 'public, max-age=604800, immutable');
+            return res.send(originalBuffer);
+        }
+
         const buffer = Buffer.from(match[2], 'base64');
         const thumbnail = await sharp(buffer)
             .resize(400, null, { withoutEnlargement: true })
             .webp({ quality: 75 })
             .toBuffer();
 
-        // LRU-style cache eviction
-        if (thumbnailCache.size >= THUMBNAIL_MAX_CACHE) {
-            const firstKey = thumbnailCache.keys().next().value;
-            thumbnailCache.delete(firstKey);
-        }
-        thumbnailCache.set(cardId, thumbnail);
+        cacheThumbnail(cardId, thumbnail, 'image/webp', 'public, max-age=2592000, immutable');
 
         res.set('Content-Type', 'image/webp');
         res.set('Cache-Control', 'public, max-age=2592000, immutable');
