@@ -7,6 +7,7 @@ const bcrypt = require('bcryptjs');
 const helmet = require('helmet');
 const compression = require('compression');
 const cookieParser = require('cookie-parser');
+const sharp = require('sharp');
 const { db, initDatabase, cleanupLoginAttempts, cleanupOldLogs } = require('./database');
 
 const app = express();
@@ -16,7 +17,8 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('he
 // ============== Middleware ==============
 app.use(helmet({
     contentSecurityPolicy: false, // Allow CDN scripts in frontend
-    crossOriginEmbedderPolicy: false
+    crossOriginEmbedderPolicy: false,
+    frameguard: false // Allow embedding in iframe from other sites
 }));
 app.use(compression());
 app.use(express.json({ limit: '50mb' }));
@@ -212,11 +214,7 @@ app.post('/api/user/register', async (req, res) => {
             return res.status(400).json({ error: '用户名长度需为2-20个字符' });
         }
         if (password.length < 6) {
-            return res.status(400).json({ error: '密码长度至少6位' });
-        }
-        // Check username allowed chars (letters, numbers, Chinese, underscore)
-        if (!/^[\w\u4e00-\u9fa5]+$/.test(username)) {
-            return res.status(400).json({ error: '用户名只能包含字母、数字、下划线或中文' });
+            return res.status(400).json({ error: '密码长度至少6个字符' });
         }
 
         const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
@@ -298,7 +296,8 @@ app.get('/api/cards', optionalUserAuth, (req, res) => {
         const cards = db.prepare(
             `SELECT cc.id, cc.name, cc.description, cc.creator_notes,
                     cc.downloads_count, cc.uploader_user_id, cc.created_at, cc.likes_count,
-                    CASE WHEN cl.id IS NOT NULL THEN 1 ELSE 0 END AS user_liked
+                    CASE WHEN cl.id IS NOT NULL THEN 1 ELSE 0 END AS user_liked,
+                    (SELECT COUNT(*) FROM character_comments cmt WHERE cmt.card_id = cc.id) AS comment_count
              FROM character_cards cc
              LEFT JOIN card_likes cl ON cl.card_id = cc.id AND cl.user_id = ?
              ORDER BY cc.${sortField} DESC`
@@ -310,10 +309,26 @@ app.get('/api/cards', optionalUserAuth, (req, res) => {
     }
 });
 
-app.get('/api/cards/:id/avatar', (req, res) => {
+app.get('/api/cards/:id/avatar', async (req, res) => {
     try {
-        const row = db.prepare('SELECT avatar_url FROM character_cards WHERE id = ?').get(req.params.id);
-        if (!row || !row.avatar_url) return res.status(404).end();
+        const row = db.prepare('SELECT avatar_url, name FROM character_cards WHERE id = ?').get(req.params.id);
+        if (!row) return res.status(404).end();
+
+        // No avatar data — generate placeholder
+        if (!row.avatar_url) {
+            const char = (row.name || '?')[0];
+            const colors = ['#6366f1','#8b5cf6','#ec4899','#f43f5e','#f97316','#14b8a6','#3b82f6','#10b981'];
+            const color = colors[req.params.id.charCodeAt(0) % colors.length];
+            const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="800" height="1067">
+                <rect width="800" height="1067" fill="${color}"/>
+                <text x="400" y="560" font-size="320" fill="white" text-anchor="middle" dominant-baseline="middle" font-family="sans-serif">${char}</text>
+            </svg>`;
+            const placeholder = await sharp(Buffer.from(svg)).png().toBuffer();
+            res.set('Content-Type', 'image/png');
+            res.set('Cache-Control', 'public, max-age=86400');
+            return res.send(placeholder);
+        }
+
         const dataUrl = row.avatar_url;
         const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
         if (!match) {
@@ -326,6 +341,85 @@ app.get('/api/cards/:id/avatar', (req, res) => {
         res.set('Cache-Control', 'public, max-age=604800, immutable');
         res.send(buffer);
     } catch (err) {
+        res.status(500).end();
+    }
+});
+
+// Thumbnail endpoint - compressed preview for card listing
+const thumbnailCache = new Map();
+const THUMBNAIL_MAX_CACHE = 500;
+
+app.get('/api/cards/:id/thumbnail', async (req, res) => {
+    try {
+        const cardId = req.params.id;
+        
+        // Check memory cache
+        if (thumbnailCache.has(cardId)) {
+            const cached = thumbnailCache.get(cardId);
+            res.set('Content-Type', 'image/webp');
+            res.set('Cache-Control', 'public, max-age=2592000, immutable');
+            return res.send(cached);
+        }
+
+        const row = db.prepare('SELECT avatar_url, name FROM character_cards WHERE id = ?').get(cardId);
+        if (!row) return res.status(404).end();
+
+        // No avatar data — generate placeholder thumbnail with first character
+        if (!row.avatar_url) {
+            const char = (row.name || '?')[0];
+            const colors = ['#6366f1','#8b5cf6','#ec4899','#f43f5e','#f97316','#14b8a6','#3b82f6','#10b981'];
+            const color = colors[cardId.charCodeAt(0) % colors.length];
+            const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="533">
+                <rect width="400" height="533" fill="${color}"/>
+                <text x="200" y="290" font-size="160" fill="white" text-anchor="middle" dominant-baseline="middle" font-family="sans-serif">${char}</text>
+            </svg>`;
+            const placeholder = await sharp(Buffer.from(svg)).webp({ quality: 75 }).toBuffer();
+            if (thumbnailCache.size >= THUMBNAIL_MAX_CACHE) {
+                const firstKey = thumbnailCache.keys().next().value;
+                thumbnailCache.delete(firstKey);
+            }
+            thumbnailCache.set(cardId, placeholder);
+            res.set('Content-Type', 'image/webp');
+            res.set('Cache-Control', 'public, max-age=86400');
+            return res.send(placeholder);
+        }
+
+        const dataUrl = row.avatar_url;
+        const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+        if (!match) {
+            return res.redirect(dataUrl);
+        }
+
+        const buffer = Buffer.from(match[2], 'base64');
+        const thumbnail = await sharp(buffer)
+            .resize(400, null, { withoutEnlargement: true })
+            .webp({ quality: 75 })
+            .toBuffer();
+
+        // LRU-style cache eviction
+        if (thumbnailCache.size >= THUMBNAIL_MAX_CACHE) {
+            const firstKey = thumbnailCache.keys().next().value;
+            thumbnailCache.delete(firstKey);
+        }
+        thumbnailCache.set(cardId, thumbnail);
+
+        res.set('Content-Type', 'image/webp');
+        res.set('Cache-Control', 'public, max-age=2592000, immutable');
+        res.send(thumbnail);
+    } catch (err) {
+        console.error('Thumbnail generation error:', err);
+        // Fallback to full avatar
+        try {
+            const row = db.prepare('SELECT avatar_url FROM character_cards WHERE id = ?').get(req.params.id);
+            if (row && row.avatar_url) {
+                const m = row.avatar_url.match(/^data:([^;]+);base64,(.+)$/);
+                if (m) {
+                    res.set('Content-Type', m[1]);
+                    res.set('Cache-Control', 'public, max-age=604800');
+                    return res.send(Buffer.from(m[2], 'base64'));
+                }
+            }
+        } catch {}
         res.status(500).end();
     }
 });
@@ -397,15 +491,45 @@ app.post('/api/cards', requireUserOrAdmin, (req, res) => {
     }
 });
 
-app.delete('/api/cards/:id', authenticateAdmin, (req, res) => {
+app.delete('/api/cards/:id', (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: '请先登录' });
+    }
     try {
+        const token = authHeader.split(' ')[1];
+        let isAdmin = false;
+        let userId = null;
+        try {
+            const decoded = jwt.verify(token, JWT_SECRET);
+            if (decoded.role === 'admin') isAdmin = true;
+            else userId = decoded.userId;
+        } catch {
+            return res.status(401).json({ error: '认证失败' });
+        }
+
         const { id } = req.params;
-        const card = db.prepare('SELECT name FROM character_cards WHERE id = ?').get(id);
-        const result = db.prepare('DELETE FROM character_cards WHERE id = ?').run(id);
-        if (result.changes === 0) {
+        const card = db.prepare('SELECT name, uploader_user_id FROM character_cards WHERE id = ?').get(id);
+        if (!card) {
             return res.status(404).json({ error: '卡片不存在' });
         }
-        logOperation({ userType: 'admin', userId: req.admin.id, username: req.admin.username, action: 'delete', targetType: 'card', targetId: id, ip: req.ip, details: { name: card?.name } });
+
+        // Only admin or card owner can delete
+        if (!isAdmin && (!userId || card.uploader_user_id !== String(userId))) {
+            return res.status(403).json({ error: '无权删除此卡片' });
+        }
+
+        const deleteAndReclaim = db.transaction(() => {
+            db.prepare('DELETE FROM character_cards WHERE id = ?').run(id);
+            // Reclaim upload credits (3) from uploader, minimum 0
+            if (card.uploader_user_id) {
+                db.prepare('UPDATE users SET download_credits = MAX(0, download_credits - 3) WHERE id = ?').run(card.uploader_user_id);
+            }
+        });
+        deleteAndReclaim();
+        thumbnailCache.delete(id);
+
+        logOperation({ userType: isAdmin ? 'admin' : 'user', userId: isAdmin ? 'admin' : userId, username: isAdmin ? 'admin' : '', action: 'delete', targetType: 'card', targetId: id, ip: req.ip, details: { name: card?.name } });
         res.json([{ id }]);
     } catch (err) {
         console.error('Delete card error:', err);
@@ -435,12 +559,11 @@ app.put('/api/cards/:id', (req, res) => {
         }
 
         const { name, description, avatar_url, data, creator_notes, created_at } = req.body;
-        if (name !== undefined || description !== undefined) {
-            return res.status(400).json({ error: '名称和描述不允许修改' });
-        }
         const fields = [];
         const values = [];
-        if (avatar_url !== undefined)    { fields.push('avatar_url = ?');    values.push(avatar_url); }
+        if (name !== undefined)          { fields.push('name = ?');          values.push(name); }
+        if (description !== undefined)   { fields.push('description = ?');   values.push(description); }
+        if (avatar_url !== undefined && avatar_url.startsWith('data:')) { fields.push('avatar_url = ?'); values.push(avatar_url); }
         if (data !== undefined)          { fields.push('data = ?');          values.push(typeof data === 'string' ? data : JSON.stringify(data)); }
         if (creator_notes !== undefined) { fields.push('creator_notes = ?'); values.push(creator_notes); }
         if (created_at !== undefined && decoded.role === 'admin') {
@@ -451,6 +574,7 @@ app.put('/api/cards/:id', (req, res) => {
         if (fields.length === 0) return res.status(400).json({ error: '无更新内容' });
         values.push(req.params.id);
         db.prepare(`UPDATE character_cards SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+        thumbnailCache.delete(req.params.id);
 
         logOperation({ userType, userId, username, action: 'edit', targetType: 'card', targetId: req.params.id, ip: req.ip, details: { name: card.name } });
 
@@ -542,7 +666,8 @@ app.get('/api/cards/:cardId/comments', optionalUserAuth, (req, res) => {
         const userId = req.user ? req.user.id : null;
 
         const comments = db.prepare(
-            `SELECT c.*, u.username as author_name 
+            `SELECT c.*, u.username as author_name,
+                    (SELECT cc2.uploader_user_id FROM character_cards cc2 WHERE cc2.id = c.card_id) as card_uploader_id
              FROM character_comments c 
              LEFT JOIN users u ON c.user_id = u.id 
              WHERE c.card_id = ? 
@@ -580,7 +705,7 @@ app.get('/api/cards/:cardId/comments', optionalUserAuth, (req, res) => {
 
 app.post('/api/cards/:cardId/comments', authenticateUser, (req, res) => {
     try {
-        const { content } = req.body;
+        const { content, reply_to_id } = req.body;
         if (!content || !content.trim()) {
             return res.status(400).json({ error: '评论内容不能为空' });
         }
@@ -598,11 +723,18 @@ app.post('/api/cards/:cardId/comments', authenticateUser, (req, res) => {
         const id = generateId();
         const now = new Date().toISOString();
 
+        // Resolve reply info
+        let replyToName = null;
+        if (reply_to_id) {
+            const replyComment = db.prepare('SELECT c.id, u.username FROM character_comments c LEFT JOIN users u ON c.user_id = u.id WHERE c.id = ?').get(reply_to_id);
+            if (replyComment) replyToName = replyComment.username || '匿名用户';
+        }
+
         // Insert comment and add 2 credits in a transaction
         const insertComment = db.transaction(() => {
             db.prepare(
-                'INSERT INTO character_comments (id, card_id, user_id, nickname, content, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-            ).run(id, req.params.cardId, userId, user.username, content.trim(), now);
+                'INSERT INTO character_comments (id, card_id, user_id, nickname, content, reply_to_id, reply_to_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+            ).run(id, req.params.cardId, userId, user.username, content.trim(), reply_to_id || null, replyToName, now);
 
             db.prepare('UPDATE users SET download_credits = download_credits + 2 WHERE id = ?').run(userId);
         });
@@ -612,6 +744,7 @@ app.post('/api/cards/:cardId/comments', authenticateUser, (req, res) => {
         comment.author_name = user.username;
         comment.user_liked = false;
         comment.is_hot = false;
+        comment.card_uploader_id = db.prepare('SELECT uploader_user_id FROM character_cards WHERE id = ?').get(req.params.cardId)?.uploader_user_id || null;
 
         const updatedUser = db.prepare('SELECT download_credits FROM users WHERE id = ?').get(userId);
         res.json({ comment, new_credits: updatedUser.download_credits });
@@ -646,17 +779,15 @@ app.post('/api/comments/:id/like', authenticateUser, (req, res) => {
             const updated = db.prepare('SELECT likes_count FROM character_comments WHERE id = ?').get(commentId);
             return res.json({ liked: false, likes_count: updated.likes_count });
         } else {
-            // Like: add like and give 1 credit
+            // Like: add like
             const likeTransaction = db.transaction(() => {
                 db.prepare('INSERT INTO comment_likes (comment_id, user_id) VALUES (?, ?)').run(commentId, userId);
                 db.prepare('UPDATE character_comments SET likes_count = likes_count + 1 WHERE id = ?').run(commentId);
-                db.prepare('UPDATE users SET download_credits = download_credits + 1 WHERE id = ?').run(userId);
             });
             likeTransaction();
 
             const updated = db.prepare('SELECT likes_count FROM character_comments WHERE id = ?').get(commentId);
-            const updatedUser = db.prepare('SELECT download_credits FROM users WHERE id = ?').get(userId);
-            return res.json({ liked: true, likes_count: updated.likes_count, new_credits: updatedUser.download_credits });
+            return res.json({ liked: true, likes_count: updated.likes_count });
         }
     } catch (err) {
         console.error('Like error:', err);
@@ -777,9 +908,16 @@ app.get('/api/admin/cards', authenticateAdmin, (req, res) => {
 
 app.delete('/api/admin/cards/:id', authenticateAdmin, (req, res) => {
     try {
-        const card = db.prepare('SELECT name FROM character_cards WHERE id = ?').get(req.params.id);
-        const result = db.prepare('DELETE FROM character_cards WHERE id = ?').run(req.params.id);
-        if (result.changes === 0) return res.status(404).json({ error: '卡片不存在' });
+        const card = db.prepare('SELECT name, uploader_user_id FROM character_cards WHERE id = ?').get(req.params.id);
+        if (!card) return res.status(404).json({ error: '卡片不存在' });
+        const deleteAndReclaim = db.transaction(() => {
+            db.prepare('DELETE FROM character_cards WHERE id = ?').run(req.params.id);
+            if (card.uploader_user_id) {
+                db.prepare('UPDATE users SET download_credits = MAX(0, download_credits - 3) WHERE id = ?').run(card.uploader_user_id);
+            }
+        });
+        deleteAndReclaim();
+        thumbnailCache.delete(req.params.id);
         logOperation({ userType: 'admin', userId: req.admin.id, username: req.admin.username, action: 'admin_delete_card', targetType: 'card', targetId: req.params.id, ip: req.ip, details: { name: card?.name } });
         res.json({ success: true });
     } catch (err) {
