@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>管理后台 - 角色卡广场</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <style>
+        [v-cloak] { display: none !important; }
+        body { font-family: 'PingFang SC', system-ui, -apple-system, sans-serif; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <div id="admin-app" v-cloak>
+        <!-- Login Screen -->
+        <div v-if="!isAuthenticated" class="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 to-indigo-100">
+            <div class="bg-white rounded-2xl shadow-xl p-8 w-full max-w-md">
+                <div class="text-center mb-8">
+                    <div class="w-16 h-16 bg-blue-600 rounded-2xl flex items-center justify-center mx-auto mb-4">
+                        <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+                        </svg>
+                    </div>
+                    <h1 class="text-2xl font-bold text-gray-900">管理员登录</h1>
+                    <p class="text-gray-500 mt-2">角色卡广场 · 管理后台</p>
+                </div>
+                <form @submit.prevent="handleLogin">
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">用户名</label>
+                            <input v-model="loginForm.username" type="text" required autocomplete="username"
+                                class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition"
+                                placeholder="请输入管理员用户名">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">密码</label>
+                            <input v-model="loginForm.password" type="password" required autocomplete="current-password"
+                                class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition"
+                                placeholder="请输入密码">
+                        </div>
+                        <div v-if="loginError" class="bg-red-50 text-red-600 text-sm p-3 rounded-xl">
+                            {{ loginError }}
+                        </div>
+                        <button type="submit" :disabled="loginLoading"
+                            class="w-full bg-blue-600 text-white py-3 rounded-xl font-medium hover:bg-blue-700 transition disabled:opacity-50 disabled:cursor-not-allowed">
+                            <span v-if="loginLoading">登录中...</span>
+                            <span v-else>登 录</span>
+                        </button>
+                    </div>
+                </form>
+                <div class="mt-6 text-center">
+                    <a href="/" class="text-sm text-gray-500 hover:text-blue-600 transition">← 返回论坛首页</a>
+                </div>
+            </div>
+        </div>
+
+        <!-- Admin Dashboard -->
+        <div v-else class="flex min-h-screen">
+            <!-- Sidebar -->
+            <aside class="w-64 bg-gray-900 text-white flex-shrink-0 flex flex-col">
+                <div class="p-6 border-b border-gray-800">
+                    <h1 class="text-lg font-bold">🎭 角色卡广场</h1>
+                    <p class="text-gray-400 text-sm mt-1">管理后台</p>
+                </div>
+                <nav class="flex-1 p-4 space-y-1">
+                    <button @click="currentPage = 'dashboard'" :class="currentPage === 'dashboard' ? 'bg-gray-800 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'" class="w-full flex items-center px-4 py-3 rounded-xl transition text-left">
+                        <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"/></svg>
+                        仪表盘
+                    </button>
+                    <button @click="currentPage = 'cards'; loadAdminCards()" :class="currentPage === 'cards' ? 'bg-gray-800 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'" class="w-full flex items-center px-4 py-3 rounded-xl transition text-left">
+                        <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+                        卡片管理
+                    </button>
+                    <button @click="currentPage = 'comments'; loadAdminComments()" :class="currentPage === 'comments' ? 'bg-gray-800 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'" class="w-full flex items-center px-4 py-3 rounded-xl transition text-left">
+                        <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z"/></svg>
+                        评论管理
+                    </button>
+                    <button @click="currentPage = 'users'; loadAdminUsers()" :class="currentPage === 'users' ? 'bg-gray-800 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'" class="w-full flex items-center px-4 py-3 rounded-xl transition text-left">
+                        <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"/></svg>
+                        用户管理
+                    </button>
+                    <button @click="currentPage = 'logs'; loadLogs()" :class="currentPage === 'logs' ? 'bg-gray-800 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'" class="w-full flex items-center px-4 py-3 rounded-xl transition text-left">
+                        <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                        操作日志
+                    </button>
+                    <button @click="currentPage = 'settings'; loadSettings()" :class="currentPage === 'settings' ? 'bg-gray-800 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'" class="w-full flex items-center px-4 py-3 rounded-xl transition text-left">
+                        <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+                        系统设置
+                    </button>
+                </nav>
+                <div class="p-4 border-t border-gray-800">
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center">
+                            <div class="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center text-sm font-bold">A</div>
+                            <span class="ml-3 text-sm text-gray-300">{{ adminUser?.username }}</span>
+                        </div>
+                        <button @click="handleLogout" class="text-gray-500 hover:text-red-400 transition" title="退出登录">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
+                        </button>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- Main Content -->
+            <main class="flex-1 overflow-auto">
+                <!-- Header -->
+                <header class="bg-white border-b border-gray-200 px-8 py-4 flex items-center justify-between">
+                    <h2 class="text-xl font-bold text-gray-900">
+                        {{ {dashboard:'仪表盘',cards:'卡片管理',comments:'评论管理',users:'用户管理',logs:'操作日志',settings:'系统设置'}[currentPage] }}
+                    </h2>
+                    <a href="/" target="_blank" class="text-sm text-blue-600 hover:text-blue-800 transition">查看前台 →</a>
+                </header>
+
+                <div class="p-8">
+                    <!-- Dashboard -->
+                    <div v-if="currentPage === 'dashboard'">
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+                            <div class="bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-sm text-gray-500">总卡片数</p>
+                                        <p class="text-3xl font-bold text-gray-900 mt-1">{{ stats.totalCards || 0 }}</p>
+                                    </div>
+                                    <div class="w-12 h-12 bg-blue-100 rounded-xl flex items-center justify-center">
+                                        <svg class="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+                                    </div>
+                                </div>
+                                <p class="text-xs text-green-600 mt-2">近7天 +{{ stats.recentCards || 0 }}</p>
+                            </div>
+                            <div class="bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-sm text-gray-500">总评论数</p>
+                                        <p class="text-3xl font-bold text-gray-900 mt-1">{{ stats.totalComments || 0 }}</p>
+                                    </div>
+                                    <div class="w-12 h-12 bg-green-100 rounded-xl flex items-center justify-center">
+                                        <svg class="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z"/></svg>
+                                    </div>
+                                </div>
+                                <p class="text-xs text-green-600 mt-2">近7天 +{{ stats.recentComments || 0 }}</p>
+                            </div>
+                            <div class="bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-sm text-gray-500">注册用户</p>
+                                        <p class="text-3xl font-bold text-gray-900 mt-1">{{ stats.totalUsers || 0 }}</p>
+                                    </div>
+                                    <div class="w-12 h-12 bg-indigo-100 rounded-xl flex items-center justify-center">
+                                        <svg class="w-6 h-6 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"/></svg>
+                                    </div>
+                                </div>
+                                <p class="text-xs text-green-600 mt-2">今日 +{{ stats.todayNewUsers || 0 }}</p>
+                            </div>
+                            <div class="bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-sm text-gray-500">总访问量</p>
+                                        <p class="text-3xl font-bold text-gray-900 mt-1">{{ stats.totalVisits || 0 }}</p>
+                                    </div>
+                                    <div class="w-12 h-12 bg-cyan-100 rounded-xl flex items-center justify-center">
+                                        <svg class="w-6 h-6 text-cyan-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Second Row: More Stats -->
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+                            <div class="bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-sm text-gray-500">总下载量</p>
+                                        <p class="text-3xl font-bold text-gray-900 mt-1">{{ stats.totalDownloads || 0 }}</p>
+                                    </div>
+                                    <div class="w-12 h-12 bg-purple-100 rounded-xl flex items-center justify-center">
+                                        <svg class="w-6 h-6 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-sm text-gray-500">总点赞数</p>
+                                        <p class="text-3xl font-bold text-gray-900 mt-1">{{ stats.totalLikes || 0 }}</p>
+                                    </div>
+                                    <div class="w-12 h-12 bg-pink-100 rounded-xl flex items-center justify-center">
+                                        <svg class="w-6 h-6 text-pink-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"/></svg>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-sm text-gray-500">今日新卡片</p>
+                                        <p class="text-3xl font-bold text-gray-900 mt-1">{{ stats.todayNewCards || 0 }}</p>
+                                    </div>
+                                    <div class="w-12 h-12 bg-yellow-100 rounded-xl flex items-center justify-center">
+                                        <svg class="w-6 h-6 text-yellow-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/></svg>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-sm text-gray-500">24h失败登录</p>
+                                        <p class="text-3xl font-bold" :class="(stats.loginAttempts || 0) > 10 ? 'text-red-600' : 'text-gray-900'">{{ stats.loginAttempts || 0 }}</p>
+                                    </div>
+                                    <div class="w-12 h-12 bg-red-100 rounded-xl flex items-center justify-center">
+                                        <svg class="w-6 h-6 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+                                    </div>
+                                </div>
+                                <p v-if="(stats.loginAttempts || 0) > 10" class="text-xs text-red-600 mt-2">⚠ 疑似暴力破解攻击</p>
+                            </div>
+                        </div>
+
+                        <!-- 7-Day Activity Chart -->
+                        <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 mb-8">
+                            <h3 class="text-lg font-bold text-gray-900 mb-4">近7日活动趋势</h3>
+                            <div class="flex items-center gap-4 mb-4 text-xs">
+                                <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-blue-500 inline-block"></span> 上传</span>
+                                <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-green-500 inline-block"></span> 评论</span>
+                                <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-purple-500 inline-block"></span> 下载</span>
+                                <span class="flex items-center gap-1"><span class="w-3 h-3 rounded bg-cyan-500 inline-block"></span> 访问</span>
+                            </div>
+                            <div class="h-48 flex items-end gap-1" v-if="chartData.length > 0">
+                                <div v-for="day in chartData" :key="day.date" class="flex-1 flex flex-col items-center gap-1">
+                                    <div class="w-full flex gap-0.5 items-end justify-center" style="height: 140px;">
+                                        <div class="flex-1 bg-blue-500 rounded-t transition-all" :style="{ height: day.uploads / chartMax * 140 + 'px', minHeight: day.uploads > 0 ? '4px' : '0' }" :title="'上传: ' + day.uploads"></div>
+                                        <div class="flex-1 bg-green-500 rounded-t transition-all" :style="{ height: day.comments / chartMax * 140 + 'px', minHeight: day.comments > 0 ? '4px' : '0' }" :title="'评论: ' + day.comments"></div>
+                                        <div class="flex-1 bg-purple-500 rounded-t transition-all" :style="{ height: day.downloads / chartMax * 140 + 'px', minHeight: day.downloads > 0 ? '4px' : '0' }" :title="'下载: ' + day.downloads"></div>
+                                        <div class="flex-1 bg-cyan-500 rounded-t transition-all" :style="{ height: day.visits / chartMax * 140 + 'px', minHeight: day.visits > 0 ? '4px' : '0' }" :title="'访问: ' + day.visits"></div>
+                                    </div>
+                                    <span class="text-[10px] text-gray-400 mt-1">{{ day.label }}</span>
+                                </div>
+                            </div>
+                            <div v-else class="h-48 flex items-center justify-center text-gray-400 text-sm">暂无活动数据</div>
+                        </div>
+
+                        <!-- Top Cards -->
+                        <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+                            <h3 class="text-lg font-bold text-gray-900 mb-4">下载排行 Top 10</h3>
+                            <div class="space-y-3">
+                                <div v-for="(card, index) in (stats.topCards || [])" :key="card.id" class="flex items-center justify-between py-2 px-3 rounded-xl hover:bg-gray-50">
+                                    <div class="flex items-center">
+                                        <span class="w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold" :class="index < 3 ? 'bg-yellow-100 text-yellow-700' : 'bg-gray-100 text-gray-600'">{{ index + 1 }}</span>
+                                        <span class="ml-3 text-gray-900">{{ card.name }}</span>
+                                    </div>
+                                    <span class="text-sm text-gray-500">{{ card.downloads_count }} 次下载</span>
+                                </div>
+                                <div v-if="!stats.topCards?.length" class="text-center text-gray-400 py-8">暂无数据</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Cards Management -->
+                    <div v-if="currentPage === 'cards'">
+                        <div class="mb-4 flex items-center gap-4">
+                            <input v-model="cardSearch" @input="loadAdminCards()" type="text" placeholder="搜索卡片名称..."
+                                class="px-4 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none w-64">
+                            <span class="text-sm text-gray-500">共 {{ cardData.total || 0 }} 张卡片</span>
+                        </div>
+                        <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                            <table class="w-full">
+                                <thead class="bg-gray-50">
+                                    <tr>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">名称</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">描述</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">下载</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">创建时间</th>
+                                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-gray-100">
+                                    <tr v-for="card in cardData.cards" :key="card.id" class="hover:bg-gray-50">
+                                        <td class="px-6 py-4 text-sm font-medium text-gray-900 max-w-[200px] truncate">{{ card.name }}</td>
+                                        <td class="px-6 py-4 text-sm text-gray-500 max-w-[300px] truncate">{{ card.description }}</td>
+                                        <td class="px-6 py-4 text-sm text-gray-500">{{ card.downloads_count }}</td>
+                                        <td class="px-6 py-4 text-sm text-gray-500">{{ formatDate(card.created_at) }}</td>
+                                        <td class="px-6 py-4 text-right">
+                                            <button @click="deleteAdminCard(card)" class="text-red-600 hover:text-red-800 text-sm font-medium">删除</button>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                            <div v-if="!cardData.cards?.length" class="text-center text-gray-400 py-12">暂无卡片</div>
+                        </div>
+                        <!-- Pagination -->
+                        <div v-if="cardData.totalPages > 1" class="flex items-center justify-center gap-2 mt-6">
+                            <button @click="cardPage--; loadAdminCards()" :disabled="cardPage <= 1" class="px-4 py-2 rounded-lg border text-sm disabled:opacity-50 hover:bg-gray-100">上一页</button>
+                            <span class="text-sm text-gray-500">{{ cardPage }} / {{ cardData.totalPages }}</span>
+                            <button @click="cardPage++; loadAdminCards()" :disabled="cardPage >= cardData.totalPages" class="px-4 py-2 rounded-lg border text-sm disabled:opacity-50 hover:bg-gray-100">下一页</button>
+                        </div>
+                    </div>
+
+                    <!-- Comments Management -->
+                    <div v-if="currentPage === 'comments'">
+                        <div class="mb-4">
+                            <span class="text-sm text-gray-500">共 {{ commentData.total || 0 }} 条评论</span>
+                        </div>
+                        <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                            <table class="w-full">
+                                <thead class="bg-gray-50">
+                                    <tr>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">所属卡片</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">昵称</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">内容</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">时间</th>
+                                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-gray-100">
+                                    <tr v-for="comment in commentData.comments" :key="comment.id" class="hover:bg-gray-50">
+                                        <td class="px-6 py-4 text-sm text-blue-600 max-w-[150px] truncate">{{ comment.card_name || '已删除' }}</td>
+                                        <td class="px-6 py-4 text-sm text-gray-500">{{ comment.nickname }}</td>
+                                        <td class="px-6 py-4 text-sm text-gray-900 max-w-[400px] truncate">{{ comment.content }}</td>
+                                        <td class="px-6 py-4 text-sm text-gray-500">{{ formatDate(comment.created_at) }}</td>
+                                        <td class="px-6 py-4 text-right">
+                                            <button @click="deleteAdminComment(comment)" class="text-red-600 hover:text-red-800 text-sm font-medium">删除</button>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                            <div v-if="!commentData.comments?.length" class="text-center text-gray-400 py-12">暂无评论</div>
+                        </div>
+                        <div v-if="commentData.totalPages > 1" class="flex items-center justify-center gap-2 mt-6">
+                            <button @click="commentPage--; loadAdminComments()" :disabled="commentPage <= 1" class="px-4 py-2 rounded-lg border text-sm disabled:opacity-50 hover:bg-gray-100">上一页</button>
+                            <span class="text-sm text-gray-500">{{ commentPage }} / {{ commentData.totalPages }}</span>
+                            <button @click="commentPage++; loadAdminComments()" :disabled="commentPage >= commentData.totalPages" class="px-4 py-2 rounded-lg border text-sm disabled:opacity-50 hover:bg-gray-100">下一页</button>
+                        </div>
+                    </div>
+
+                    <!-- Users Management -->
+                    <div v-if="currentPage === 'users'">
+                        <div class="flex items-center justify-between mb-4">
+                            <span class="text-sm text-gray-500">共 {{ userData.total || 0 }} 位注册用户</span>
+                            <input v-model="userSearch" @input="userPage = 1; loadAdminUsers()" placeholder="搜索用户名..." class="px-4 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-64" />
+                        </div>
+                        <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                            <table class="w-full">
+                                <thead class="bg-gray-50">
+                                    <tr>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">ID</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">用户名</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">密码哈希</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">下载积分</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">注册时间</th>
+                                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">最后登录</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-gray-100">
+                                    <tr v-for="user in userData.users" :key="user.id" class="hover:bg-gray-50">
+                                        <td class="px-6 py-4 text-sm text-gray-900 font-mono">{{ user.id }}</td>
+                                        <td class="px-6 py-4 text-sm font-medium text-gray-900">{{ user.username }}</td>
+                                        <td class="px-6 py-4 text-sm font-mono">
+                                            <span v-if="showPasswordId !== user.id" class="text-gray-400 cursor-pointer" @click="showPasswordId = user.id">●●●●●●●● (点击查看)</span>
+                                            <span v-else class="text-gray-600 text-xs break-all cursor-pointer" @click="showPasswordId = null">{{ user.password_hash }}</span>
+                                        </td>
+                                        <td class="px-6 py-4 text-sm text-gray-900">{{ user.download_credits }}</td>
+                                        <td class="px-6 py-4 text-sm text-gray-500">{{ formatDate(user.created_at) }}</td>
+                                        <td class="px-6 py-4 text-sm text-gray-500">{{ user.last_login ? formatDate(user.last_login) : '从未' }}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                            <div v-if="!userData.users?.length" class="text-center text-gray-400 py-12">暂无用户</div>
+                        </div>
+                        <div v-if="userData.totalPages > 1" class="flex items-center justify-center gap-2 mt-6">
+                            <button @click="userPage--; loadAdminUsers()" :disabled="userPage <= 1" class="px-4 py-2 rounded-lg border text-sm disabled:opacity-50 hover:bg-gray-100">上一页</button>
+                            <span class="text-sm text-gray-500">{{ userPage }} / {{ userData.totalPages }}</span>
+                            <button @click="userPage++; loadAdminUsers()" :disabled="userPage >= userData.totalPages" class="px-4 py-2 rounded-lg border text-sm disabled:opacity-50 hover:bg-gray-100">下一页</button>
+                        </div>
+                    </div>
+
+                    <!-- Operation Logs -->
+                    <div v-if="currentPage === 'logs'">
+                        <div class="flex items-center justify-between mb-4">
+                            <span class="text-sm text-gray-500">共 {{ logData.total || 0 }} 条记录</span>
+                            <select v-model="logActionFilter" @change="logPage = 1; loadLogs()" class="px-4 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                <option value="">全部操作</option>
+                                <option value="login">登录</option>
+                                <option value="register">注册</option>
+                                <option value="upload">上传</option>
+                                <option value="download">下载</option>
+                                <option value="edit">编辑</option>
+                                <option value="delete">删除</option>
+                                <option value="admin_login">管理员登录</option>
+                                <option value="admin_delete_card">管理员删卡</option>
+                                <option value="admin_delete_comment">管理员删评论</option>
+                            </select>
+                        </div>
+                        <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                            <table class="w-full">
+                                <thead class="bg-gray-50">
+                                    <tr>
+                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">时间</th>
+                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">类型</th>
+                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">用户</th>
+                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">操作</th>
+                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">目标</th>
+                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">IP</th>
+                                        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">详情</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-gray-100">
+                                    <tr v-for="log in logData.logs" :key="log.id" class="hover:bg-gray-50">
+                                        <td class="px-4 py-3 text-xs text-gray-500 whitespace-nowrap">{{ formatDate(log.created_at) }}</td>
+                                        <td class="px-4 py-3">
+                                            <span class="text-xs px-2 py-0.5 rounded-full font-medium" :class="{
+                                                'bg-indigo-100 text-indigo-700': log.user_type === 'admin',
+                                                'bg-blue-100 text-blue-700': log.user_type === 'user',
+                                                'bg-gray-100 text-gray-600': log.user_type === 'anonymous'
+                                            }">{{ log.user_type }}</span>
+                                        </td>
+                                        <td class="px-4 py-3 text-sm text-gray-900">{{ log.username || '-' }}</td>
+                                        <td class="px-4 py-3">
+                                            <span class="text-xs px-2 py-0.5 rounded-full font-medium" :class="{
+                                                'bg-blue-100 text-blue-700': log.action === 'login',
+                                                'bg-green-100 text-green-700': log.action === 'register',
+                                                'bg-purple-100 text-purple-700': log.action === 'upload',
+                                                'bg-cyan-100 text-cyan-700': log.action === 'download',
+                                                'bg-yellow-100 text-yellow-700': log.action === 'edit',
+                                                'bg-red-100 text-red-700': log.action?.includes('delete'),
+                                                'bg-indigo-100 text-indigo-700': log.action === 'admin_login'
+                                            }">{{ getActionLabel(log.action) }}</span>
+                                        </td>
+                                        <td class="px-4 py-3 text-xs text-gray-500">
+                                            <span v-if="log.target_type">{{ log.target_type }}#{{ log.target_id }}</span>
+                                            <span v-else>-</span>
+                                        </td>
+                                        <td class="px-4 py-3 text-xs text-gray-500 font-mono">{{ log.ip_address || '-' }}</td>
+                                        <td class="px-4 py-3 text-xs text-gray-500 max-w-xs truncate" :title="log.details">{{ log.details || '-' }}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                            <div v-if="!logData.logs?.length" class="text-center text-gray-400 py-12">暂无日志</div>
+                        </div>
+                        <div v-if="logData.totalPages > 1" class="flex items-center justify-center gap-2 mt-6">
+                            <button @click="logPage--; loadLogs()" :disabled="logPage <= 1" class="px-4 py-2 rounded-lg border text-sm disabled:opacity-50 hover:bg-gray-100">上一页</button>
+                            <span class="text-sm text-gray-500">{{ logPage }} / {{ logData.totalPages }}</span>
+                            <button @click="logPage++; loadLogs()" :disabled="logPage >= logData.totalPages" class="px-4 py-2 rounded-lg border text-sm disabled:opacity-50 hover:bg-gray-100">下一页</button>
+                        </div>
+                    </div>
+
+                    <!-- Settings -->
+                    <div v-if="currentPage === 'settings'">
+                        <div class="max-w-2xl space-y-6">
+                            <!-- Site Settings -->
+                            <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+                                <h3 class="text-lg font-bold text-gray-900 mb-4">站点设置</h3>
+                                <div class="space-y-4">
+                                    <div>
+                                        <label class="block text-sm font-medium text-gray-700 mb-1">站点名称</label>
+                                        <input v-model="siteSettings.site_name" type="text" class="w-full px-4 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none">
+                                    </div>
+                                    <div>
+                                        <label class="block text-sm font-medium text-gray-700 mb-1">站点描述</label>
+                                        <input v-model="siteSettings.site_description" type="text" class="w-full px-4 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none">
+                                    </div>
+                                    <div class="flex items-center gap-8">
+                                        <label class="flex items-center gap-2">
+                                            <input v-model="siteSettings.allow_anonymous_upload" type="checkbox" true-value="true" false-value="false" class="w-4 h-4 text-blue-600 rounded">
+                                            <span class="text-sm text-gray-700">允许匿名上传</span>
+                                        </label>
+                                        <label class="flex items-center gap-2">
+                                            <input v-model="siteSettings.allow_anonymous_comment" type="checkbox" true-value="true" false-value="false" class="w-4 h-4 text-blue-600 rounded">
+                                            <span class="text-sm text-gray-700">允许匿名评论</span>
+                                        </label>
+                                    </div>
+                                    <button @click="saveSettings" class="bg-blue-600 text-white px-6 py-2 rounded-xl hover:bg-blue-700 transition text-sm font-medium">保存设置</button>
+                                </div>
+                            </div>
+
+                            <!-- Change Password -->
+                            <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+                                <h3 class="text-lg font-bold text-gray-900 mb-4">修改密码</h3>
+                                <div class="space-y-4">
+                                    <div>
+                                        <label class="block text-sm font-medium text-gray-700 mb-1">当前密码</label>
+                                        <input v-model="passwordForm.currentPassword" type="password" autocomplete="current-password" class="w-full px-4 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none">
+                                    </div>
+                                    <div>
+                                        <label class="block text-sm font-medium text-gray-700 mb-1">新密码</label>
+                                        <input v-model="passwordForm.newPassword" type="password" autocomplete="new-password" class="w-full px-4 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none">
+                                    </div>
+                                    <div>
+                                        <label class="block text-sm font-medium text-gray-700 mb-1">确认新密码</label>
+                                        <input v-model="passwordForm.confirmPassword" type="password" autocomplete="new-password" class="w-full px-4 py-2 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none">
+                                    </div>
+                                    <div v-if="passwordError" class="bg-red-50 text-red-600 text-sm p-3 rounded-xl">{{ passwordError }}</div>
+                                    <div v-if="passwordSuccess" class="bg-green-50 text-green-600 text-sm p-3 rounded-xl">{{ passwordSuccess }}</div>
+                                    <button @click="changePassword" class="bg-blue-600 text-white px-6 py-2 rounded-xl hover:bg-blue-700 transition text-sm font-medium">修改密码</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+
+        <!-- Toast Notifications -->
+        <div class="fixed top-4 right-4 z-50 space-y-2">
+            <div v-for="toast in toasts" :key="toast.id"
+                :class="{
+                    'bg-green-500': toast.type === 'success',
+                    'bg-red-500': toast.type === 'error',
+                    'bg-yellow-500': toast.type === 'warning',
+                    'bg-blue-500': toast.type === 'info'
+                }"
+                class="text-white px-4 py-3 rounded-xl shadow-lg text-sm max-w-sm animate-slide-in">
+                {{ toast.message }}
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const { createApp, ref, reactive, computed, onMounted } = Vue;
+
+        createApp({
+            setup() {
+                const API_BASE = '';
+                const token = ref(localStorage.getItem('admin_token') || '');
+                const isAuthenticated = ref(false);
+                const adminUser = ref(null);
+                const currentPage = ref('dashboard');
+                const toasts = ref([]);
+
+                // Login
+                const loginForm = reactive({ username: '', password: '' });
+                const loginError = ref('');
+                const loginLoading = ref(false);
+
+                // Stats
+                const stats = ref({});
+
+                // Cards
+                const cardData = ref({ cards: [], total: 0, totalPages: 0 });
+                const cardPage = ref(1);
+                const cardSearch = ref('');
+
+                // Comments
+                const commentData = ref({ comments: [], total: 0, totalPages: 0 });
+                const commentPage = ref(1);
+
+                // Users
+                const userData = ref({ users: [], total: 0, totalPages: 0 });
+                const userPage = ref(1);
+                const userSearch = ref('');
+                const showPasswordId = ref(null);
+
+                // Logs
+                const logData = ref({ logs: [], total: 0, totalPages: 0 });
+                const logPage = ref(1);
+                const logActionFilter = ref('');
+
+                // Chart
+                const chartData = computed(() => {
+                    if (!stats.value.dailyActivity) return [];
+                    const activity = stats.value.dailyActivity ?? [];
+                    const comments = stats.value.dailyComments ?? [];
+                    const visits = stats.value.dailyVisits ?? [];
+                    const days = [];
+                    for (let i = 6; i >= 0; i--) {
+                        const d = new Date(); d.setDate(d.getDate() - i);
+                        const dateStr = d.toISOString().slice(0, 10);
+                        const label = (d.getMonth()+1) + '/' + d.getDate();
+                        const a = activity.find(x => x.day === dateStr);
+                        const c = comments.find(x => x.day === dateStr);
+                        const v = visits.find(x => x.day === dateStr);
+                        days.push({
+                            date: dateStr, label,
+                            uploads: a ? (a.uploads || 0) : 0,
+                            downloads: a ? (a.downloads || 0) : 0,
+                            comments: c ? (c.comments || 0) : 0,
+                            visits: v ? (v.visits || 0) : 0
+                        });
+                    }
+                    return days;
+                });
+                const chartMax = computed(() => {
+                    if (!chartData.value.length) return 1;
+                    const max = Math.max(...chartData.value.flatMap(d => [d.uploads, d.downloads, d.comments, d.visits]));
+                    return max || 1;
+                });
+
+                // Settings
+                const siteSettings = reactive({
+                    site_name: '',
+                    site_description: '',
+                    allow_anonymous_upload: 'true',
+                    allow_anonymous_comment: 'true'
+                });
+
+                // Password
+                const passwordForm = reactive({ currentPassword: '', newPassword: '', confirmPassword: '' });
+                const passwordError = ref('');
+                const passwordSuccess = ref('');
+
+                function authHeaders() {
+                    return { 'Authorization': 'Bearer ' + token.value, 'Content-Type': 'application/json' };
+                }
+
+                function showToast(message, type = 'info') {
+                    const id = Date.now();
+                    toasts.value.push({ id, message, type });
+                    setTimeout(() => { toasts.value = toasts.value.filter(t => t.id !== id); }, 3000);
+                }
+
+                function formatDate(dateStr) {
+                    if (!dateStr) return '-';
+                    return new Date(dateStr).toLocaleString('zh-CN');
+                }
+
+                async function handleLogin() {
+                    loginError.value = '';
+                    loginLoading.value = true;
+                    try {
+                        const resp = await fetch(API_BASE + '/api/auth/login', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ username: loginForm.username, password: loginForm.password })
+                        });
+                        const data = await resp.json();
+                        if (!resp.ok) {
+                            loginError.value = data.error || '登录失败';
+                            return;
+                        }
+                        token.value = data.token;
+                        adminUser.value = data.user;
+                        isAuthenticated.value = true;
+                        localStorage.setItem('admin_token', data.token);
+                        loadDashboard();
+                    } catch (err) {
+                        loginError.value = '网络错误，请重试';
+                    } finally {
+                        loginLoading.value = false;
+                    }
+                }
+
+                function handleLogout() {
+                    token.value = '';
+                    isAuthenticated.value = false;
+                    adminUser.value = null;
+                    localStorage.removeItem('admin_token');
+                }
+
+                async function checkAuth() {
+                    if (!token.value) return;
+                    try {
+                        const resp = await fetch(API_BASE + '/api/auth/me', { headers: authHeaders() });
+                        if (resp.ok) {
+                            const data = await resp.json();
+                            adminUser.value = data.user;
+                            isAuthenticated.value = true;
+                            loadDashboard();
+                        } else {
+                            handleLogout();
+                        }
+                    } catch (err) {
+                        handleLogout();
+                    }
+                }
+
+                async function loadDashboard() {
+                    try {
+                        const resp = await fetch(API_BASE + '/api/admin/stats', { headers: authHeaders() });
+                        if (resp.ok) stats.value = await resp.json();
+                    } catch (err) {
+                        console.error('Stats error:', err);
+                    }
+                }
+
+                async function loadAdminCards() {
+                    try {
+                        const resp = await fetch(API_BASE + `/api/admin/cards?page=${cardPage.value}&search=${encodeURIComponent(cardSearch.value)}`, { headers: authHeaders() });
+                        if (resp.ok) cardData.value = await resp.json();
+                    } catch (err) {
+                        console.error('Cards error:', err);
+                    }
+                }
+
+                async function deleteAdminCard(card) {
+                    if (!confirm(`确定删除卡片 "${card.name}" 吗？`)) return;
+                    try {
+                        const resp = await fetch(API_BASE + '/api/admin/cards/' + card.id, { method: 'DELETE', headers: authHeaders() });
+                        if (resp.ok) {
+                            showToast('卡片已删除', 'success');
+                            loadAdminCards();
+                            loadDashboard();
+                        }
+                    } catch (err) {
+                        showToast('删除失败', 'error');
+                    }
+                }
+
+                async function loadAdminComments() {
+                    try {
+                        const resp = await fetch(API_BASE + `/api/admin/comments?page=${commentPage.value}`, { headers: authHeaders() });
+                        if (resp.ok) commentData.value = await resp.json();
+                    } catch (err) {
+                        console.error('Comments error:', err);
+                    }
+                }
+
+                async function deleteAdminComment(comment) {
+                    if (!confirm('确定删除这条评论吗？')) return;
+                    try {
+                        const resp = await fetch(API_BASE + '/api/admin/comments/' + comment.id, { method: 'DELETE', headers: authHeaders() });
+                        if (resp.ok) {
+                            showToast('评论已删除', 'success');
+                            loadAdminComments();
+                            loadDashboard();
+                        }
+                    } catch (err) {
+                        showToast('删除失败', 'error');
+                    }
+                }
+
+                async function loadAdminUsers() {
+                    try {
+                        const resp = await fetch(API_BASE + `/api/admin/users?page=${userPage.value}&search=${encodeURIComponent(userSearch.value)}`, { headers: authHeaders() });
+                        if (resp.ok) userData.value = await resp.json();
+                    } catch (err) {
+                        console.error('Users error:', err);
+                    }
+                }
+
+                async function loadLogs() {
+                    try {
+                        let url = API_BASE + `/api/admin/logs?page=${logPage.value}`;
+                        if (logActionFilter.value) url += `&action=${encodeURIComponent(logActionFilter.value)}`;
+                        const resp = await fetch(url, { headers: authHeaders() });
+                        if (resp.ok) logData.value = await resp.json();
+                    } catch (err) {
+                        console.error('Logs error:', err);
+                    }
+                }
+
+                function getActionLabel(action) {
+                    const labels = {
+                        login: '登录', register: '注册', upload: '上传',
+                        download: '下载', edit: '编辑', delete: '删除',
+                        admin_login: '管理员登录', admin_delete_card: '管理员删卡',
+                        admin_delete_comment: '管理员删评论'
+                    };
+                    return labels[action] || action;
+                }
+
+                async function loadSettings() {
+                    try {
+                        const resp = await fetch(API_BASE + '/api/admin/settings', { headers: authHeaders() });
+                        if (resp.ok) {
+                            const data = await resp.json();
+                            Object.assign(siteSettings, data);
+                        }
+                    } catch (err) {
+                        console.error('Settings error:', err);
+                    }
+                }
+
+                async function saveSettings() {
+                    try {
+                        const resp = await fetch(API_BASE + '/api/admin/settings', {
+                            method: 'PUT', headers: authHeaders(),
+                            body: JSON.stringify(siteSettings)
+                        });
+                        if (resp.ok) showToast('设置已保存', 'success');
+                    } catch (err) {
+                        showToast('保存失败', 'error');
+                    }
+                }
+
+                async function changePassword() {
+                    passwordError.value = '';
+                    passwordSuccess.value = '';
+                    if (passwordForm.newPassword !== passwordForm.confirmPassword) {
+                        passwordError.value = '两次输入的新密码不一致';
+                        return;
+                    }
+                    if (passwordForm.newPassword.length < 6) {
+                        passwordError.value = '新密码长度至少6位';
+                        return;
+                    }
+                    try {
+                        const resp = await fetch(API_BASE + '/api/admin/password', {
+                            method: 'PUT', headers: authHeaders(),
+                            body: JSON.stringify({ currentPassword: passwordForm.currentPassword, newPassword: passwordForm.newPassword })
+                        });
+                        const data = await resp.json();
+                        if (!resp.ok) {
+                            passwordError.value = data.error || '修改失败';
+                            return;
+                        }
+                        passwordSuccess.value = '密码修改成功';
+                        passwordForm.currentPassword = '';
+                        passwordForm.newPassword = '';
+                        passwordForm.confirmPassword = '';
+                    } catch (err) {
+                        passwordError.value = '网络错误';
+                    }
+                }
+
+                onMounted(() => {
+                    checkAuth();
+                });
+
+                return {
+                    isAuthenticated, adminUser, currentPage, toasts,
+                    loginForm, loginError, loginLoading, handleLogin, handleLogout,
+                    stats, formatDate, chartData, chartMax,
+                    cardData, cardPage, cardSearch, loadAdminCards, deleteAdminCard,
+                    commentData, commentPage, loadAdminComments, deleteAdminComment,
+                    userData, userPage, userSearch, showPasswordId, loadAdminUsers,
+                    logData, logPage, logActionFilter, loadLogs, getActionLabel,
+                    siteSettings, loadSettings, saveSettings,
+                    passwordForm, passwordError, passwordSuccess, changePassword
+                };
+            }
+        }).mount('#admin-app');
+    </script>
+</body>
+</html>

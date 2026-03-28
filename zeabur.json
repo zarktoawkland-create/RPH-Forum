@@ -1,0 +1,49 @@
+{
+    "template": "ZEABUR",
+    "services": [
+        {
+            "name": "rp-forum",
+            "template": "GIT",
+            "env": {
+                "ADMIN_USERNAME": {
+                    "default": "admin",
+                    "expose": false,
+                    "readonly": false
+                },
+                "ADMIN_PASSWORD": {
+                    "default": "123456",
+                    "expose": false,
+                    "readonly": false
+                },
+                "JWT_SECRET": {
+                    "default": "${PASSWORD}",
+                    "expose": false,
+                    "readonly": true
+                },
+                "PORT": {
+                    "default": "9191",
+                    "expose": false,
+                    "readonly": true
+                },
+                "DATA_DIR": {
+                    "default": "/app/data",
+                    "expose": false,
+                    "readonly": true
+                }
+            },
+            "ports": [
+                {
+                    "id": "web",
+                    "port": 9191,
+                    "type": "HTTP"
+                }
+            ],
+            "volumes": [
+                {
+                    "id": "data",
+                    "dir": "/app/data"
+                }
+            ]
+        }
+    ]
+}
