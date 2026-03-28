@@ -359,31 +359,33 @@
                         <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path></svg>
                         评论 +2
                     </div>
-                    <div class="px-2.5 py-1 bg-pink-50 text-pink-600 border border-pink-100 text-xs font-bold rounded-xl whitespace-nowrap flex items-center gap-1">
-                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
-                        点赞 +1
-                    </div>
                 </div>
             </div>
 
             <!-- Sort + Tags row -->
             <div v-if="!loading" class="mb-5 animate-fade-in">
                 <div class="flex items-start gap-2">
+                    <!-- Sort dropdown (outside overflow container) -->
+                    <div class="relative flex-shrink-0">
+                        <button @click.stop="showSortDropdown = !showSortDropdown" class="flex items-center gap-1 px-2.5 py-1.5 bg-gray-100 rounded-xl text-xs font-bold transition-all hover:bg-gray-200">
+                            <svg v-if="cardSort === 'latest'" class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            <svg v-else class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+                            <span :class="cardSort === 'hot' ? 'text-rose-500' : 'text-primary-600'">{{ cardSort === 'latest' ? '最新' : '热门' }}</span>
+                            <svg class="w-3 h-3 text-gray-400 transition-transform" :class="showSortDropdown ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                        </button>
+                        <div v-if="showSortDropdown" class="absolute top-full left-0 mt-1 bg-white rounded-xl shadow-lg border border-gray-100 py-1 z-30 min-w-[5rem]">
+                            <button @click="cardSort = 'latest'; showSortDropdown = false" class="w-full flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold transition-all hover:bg-gray-50" :class="cardSort === 'latest' ? 'text-primary-600' : 'text-gray-500'">
+                                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                最新
+                            </button>
+                            <button @click="cardSort = 'hot'; showSortDropdown = false" class="w-full flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold transition-all hover:bg-gray-50" :class="cardSort === 'hot' ? 'text-rose-500' : 'text-gray-500'">
+                                <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+                                热门
+                            </button>
+                        </div>
+                    </div>
                     <div class="flex-1 min-w-0">
                         <div class="flex items-center gap-2" :class="tagsExpanded ? 'flex-wrap' : 'flex-nowrap overflow-hidden'">
-                            <!-- Sort pill switch -->
-                            <div class="flex items-center bg-gray-100 rounded-xl p-0.5 gap-0.5 text-xs font-bold flex-shrink-0">
-                        <button @click="cardSort = 'latest'" class="flex items-center gap-1 px-2.5 py-1 rounded-[10px] transition-all"
-                                :class="cardSort === 'latest' ? 'bg-white text-primary-600 shadow-sm' : 'text-gray-400 hover:text-gray-600'">
-                            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                            最新
-                        </button>
-                        <button @click="cardSort = 'hot'" class="flex items-center gap-1 px-2.5 py-1 rounded-[10px] transition-all"
-                                :class="cardSort === 'hot' ? 'bg-white text-rose-500 shadow-sm' : 'text-gray-400 hover:text-gray-600'">
-                            <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
-                            热门
-                        </button>
-                            </div>
                             <!-- Tags (only on non-mine tab) -->
                             <template v-if="currentTab !== 'mine' && visiblePopularTags.length > 0">
                                 <button v-for="tag in visiblePopularTags" :key="tag"
@@ -439,7 +441,10 @@
                     
                     <!-- Avatar (3:4 Ratio, Zero Padding) -->
                     <div class="relative w-[7.5rem] sm:w-48 flex-shrink-0 bg-gray-100">
-                        <img :src="card.avatar_url || card.avatar || defaultAvatar" class="absolute inset-0 w-full h-full object-cover transition-transform duration-700" loading="lazy">
+                        <div class="absolute inset-0 flex items-center justify-center">
+                            <div class="animate-spin rounded-full h-6 w-6 border-2 border-primary-300 border-t-transparent"></div>
+                        </div>
+                        <img :src="card.thumbnail_url || card.avatar_url || defaultAvatar" class="absolute inset-0 w-full h-full object-cover transition-opacity duration-300" @load="$event.target.style.opacity = 1" @error="if ($event.target.dataset.fallback) return; $event.target.dataset.fallback = '1'; $event.target.src = defaultAvatar; $event.target.style.opacity = 1" style="opacity: 0">
                         
                         <!-- Download Count (Admin Only) - Moved to Avatar Bottom Right -->
                         <div v-if="isAdmin" class="absolute bottom-2 right-2 bg-black/50 backdrop-blur-md text-white text-[10px] font-bold px-2 py-1 rounded-lg flex items-center gap-1 border border-white/20 shadow-lg">
@@ -507,8 +512,12 @@
                             <div class="text-xs sm:text-sm text-gray-500 mt-2 leading-relaxed break-words prose prose-sm max-w-none [&_*]:inline [&_p]:my-0 [&_h1]:text-sm [&_h2]:text-sm [&_h3]:text-sm [&_ul]:my-0 [&_li]:my-0 [&_strong]:font-medium [&_strong]:text-black overflow-hidden relative" :class="card.creator_notes ? 'line-clamp-5 sm:line-clamp-6' : 'line-clamp-6 sm:line-clamp-[8]'" v-html="renderMarkdown(card.description || '暂无描述')"></div>
                         </div>
 
-                        <!-- Like Button -->
-                        <div class="mt-auto pt-2 flex items-center justify-end">
+                        <!-- Like & Comment counts -->
+                        <div class="mt-auto pt-2 flex items-center justify-end gap-2">
+                            <span class="flex items-center gap-1 px-2 py-1 rounded-xl text-xs font-bold text-gray-400">
+                                <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path></svg>
+                                <span>{{ card.comment_count || 0 }}</span>
+                            </span>
                             <button @click.stop="likeCard(card)"
                                     class="flex items-center gap-1 px-2.5 py-1 rounded-xl text-xs font-bold transition-all hover:scale-105 active:scale-95"
                                     :class="card.user_liked ? 'text-rose-500 bg-rose-50' : 'text-gray-400 hover:text-rose-400 hover:bg-rose-50'">
@@ -696,6 +705,12 @@
                     </button>
                 </div>
                 <div class="p-5 sm:p-6 overflow-y-auto custom-scrollbar flex flex-col gap-4">
+                    <!-- Preview -->
+                    <div v-if="editingCard.avatar_url" class="flex justify-center">
+                        <div class="w-24 h-32 rounded-xl overflow-hidden shadow-md ring-2 ring-gray-100">
+                            <img :src="editingCard.avatar_url" class="w-full h-full object-cover" @error="if (!$event.target.dataset.fallback) { $event.target.dataset.fallback = '1'; $event.target.src = defaultAvatar }">
+                        </div>
+                    </div>
                     <!-- Re-upload file -->
                     <div>
                         <label class="block text-sm font-medium text-gray-700 mb-1">重新上传文件（可选）</label>
@@ -705,23 +720,15 @@
                             <input type="file" accept=".png,.json" @change="handleEditFileSelect" class="hidden">
                         </label>
                     </div>
-                    <!-- Preview -->
-                    <div v-if="editingCard.avatar_url" class="flex justify-center">
-                        <div class="w-24 h-32 rounded-xl overflow-hidden shadow-md ring-2 ring-gray-100">
-                            <img :src="editingCard.avatar_url" class="w-full h-full object-cover">
-                        </div>
-                    </div>
                     <!-- Name -->
                     <div>
                         <label class="block text-sm font-medium text-gray-700 mb-1">名称</label>
-                        <input v-model="editingCard.name" type="text" readonly class="w-full px-4 py-2.5 border border-gray-200 rounded-xl bg-gray-50 text-gray-500 outline-none text-sm cursor-not-allowed">
-                        <p class="mt-1 text-xs text-gray-400">名称不可修改</p>
+                        <input v-model="editingCard.name" type="text" class="w-full px-4 py-2.5 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm">
                     </div>
                     <!-- Description -->
                     <div>
                         <label class="block text-sm font-medium text-gray-700 mb-1">描述</label>
-                        <textarea v-model="editingCard.description" rows="3" readonly class="w-full px-4 py-2.5 border border-gray-200 rounded-xl bg-gray-50 text-gray-500 outline-none text-sm resize-none cursor-not-allowed"></textarea>
-                        <p class="mt-1 text-xs text-gray-400">描述不可修改</p>
+                        <textarea v-model="editingCard.description" rows="3" class="w-full px-4 py-2.5 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm resize-none"></textarea>
                     </div>
                     <!-- Creator Notes -->
                     <div>
@@ -754,10 +761,14 @@
                 </button>
 
                 <!-- Fixed Background Image -->
-                <div class="fixed top-0 left-0 w-full h-[80vh] z-0 overflow-hidden">
+                <div class="fixed top-0 left-0 w-full h-[80vh] z-0 overflow-hidden bg-gray-100">
+                    <div class="absolute inset-0 flex items-center justify-center">
+                        <div class="animate-spin rounded-full h-8 w-8 border-3 border-white/50 border-t-transparent"></div>
+                    </div>
                     <img :src="selectedCard.avatar_url || selectedCard.avatar || defaultAvatar"
                          class="w-full h-full object-cover object-top transition-all duration-200 ease-out"
-                         :style="{ filter: `blur(${mobileScrollBlur}px)`, transform: `scale(${1 + mobileScrollBlur/150})` }">
+                         :style="{ filter: `blur(${mobileScrollBlur}px)`, transform: `scale(${1 + mobileScrollBlur/150})` }"
+                         @load="$event.target.style.opacity = 1" @error="if (!$event.target.dataset.fallback) { $event.target.dataset.fallback = '1'; $event.target.src = defaultAvatar; $event.target.style.opacity = 1 }" style="opacity: 0">
                     <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/20"></div>
                 </div>
 
@@ -831,43 +842,23 @@
                                 
                                 <div class="bg-gray-50 rounded-2xl p-4 mb-6 border border-gray-100">
                                     <div class="flex flex-col gap-3">
-                                        <textarea v-model="newComment.content" rows="3" :placeholder="isLoggedIn ? '写下你的评论（至少5个字）...' : '请先登录后再评论...'" class="bg-white border border-gray-200 rounded-xl px-4 py-3 text-sm focus:border-primary-500 outline-none transition-colors resize-none" :disabled="!isLoggedIn"></textarea>
+                                        <div v-if="newComment.reply_to_id" class="flex items-center gap-2 text-xs text-primary-600 bg-primary-50 px-3 py-1.5 rounded-lg">
+                                            <span>回复 <b>{{ newComment.reply_to_name }}</b></span>
+                                            <button @click="cancelReply" class="text-gray-400 hover:text-gray-600 ml-auto">&times;</button>
+                                        </div>
+                                        <textarea v-model="newComment.content" rows="3" :placeholder="newComment.reply_to_id ? '写下你的回复...' : (isLoggedIn ? '写下你的评论（至少5个字）...' : '请先登录后再评论...')" class="bg-white border border-gray-200 rounded-xl px-4 py-3 text-sm focus:border-primary-500 outline-none transition-colors resize-none" :disabled="!isLoggedIn"></textarea>
                                         <div class="flex items-center justify-between">
                                             <span v-if="!isLoggedIn" class="text-xs text-gray-400">
                                                 <button @click="showUserAuthModal = true; userAuthMode = 'login'" class="text-primary-600 font-bold hover:underline">登录</button>
-                                                后即可评论，每条评论可获得 1 次下载机会
+                                                后即可评论
                                             </span>
-                                            <span v-else class="text-xs text-gray-400">每条评论（≥5字）可获得 1 次下载机会</span>
+                                            <span v-else class="text-xs text-gray-400">每条评论（≥5字）可获得 2 次下载机会</span>
                                             <button @click="submitComment" :disabled="!isLoggedIn" class="bg-primary-600 text-white px-6 py-2 rounded-xl text-sm font-bold shadow-md shadow-primary-200 active:scale-95 transition-all disabled:opacity-50">发布</button>
                                         </div>
                                     </div>
                                 </div>
 
                                 <!-- Hot Comment -->
-                                <div v-if="comments.find(c => c.is_hot)" class="mb-4">
-                                    <div class="bg-gradient-to-r from-orange-50 to-yellow-50 rounded-2xl p-4 border border-orange-100 relative overflow-hidden">
-                                        <div class="absolute top-2 right-2 bg-orange-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full flex items-center gap-1">
-                                            <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path d="M12.395 2.553a1 1 0 00-1.45-.385c-.345.23-.614.558-.822.88-.214.33-.403.713-.57 1.116-.334.804-.614 1.768-.84 2.734a31.365 31.365 0 00-.613 3.58 2.64 2.64 0 01-.945-1.067c-.328-.68-.398-1.534-.398-2.654A1 1 0 005.05 6.05 6.981 6.981 0 003 11a7 7 0 1011.95-4.95c-.592-.591-.98-.985-1.348-1.467-.363-.476-.724-1.063-1.207-2.03zM12.12 15.12A3 3 0 017 13s.879.5 2.5.5c0-1 .5-4 1.25-4.5.5 1 .786 1.293 1.371 1.879A2.99 2.99 0 0113 13a2.99 2.99 0 01-.879 2.121z"></path></svg>
-                                            热门
-                                        </div>
-                                        <template v-for="comment in comments" :key="'hot-' + comment.id">
-                                            <div v-if="comment.is_hot">
-                                                <div class="flex items-center gap-2 mb-2">
-                                                    <span class="text-xs font-bold text-orange-600">{{ comment.author_name || comment.nickname }}</span>
-                                                    <span class="text-[10px] text-orange-400">{{ formatDate(comment.created_at) }}</span>
-                                                </div>
-                                                <p class="text-gray-700 text-sm leading-relaxed whitespace-pre-wrap">{{ comment.content }}</p>
-                                                <div class="flex items-center gap-2 mt-2">
-                                                    <button @click="likeComment(comment)" class="flex items-center gap-1 text-xs transition-all" :class="comment.user_liked ? 'text-pink-500' : 'text-gray-400 hover:text-pink-400'">
-                                                        <svg class="w-4 h-4" :fill="comment.user_liked ? 'currentColor' : 'none'" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
-                                                        {{ comment.likes_count || 0 }}
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        </template>
-                                    </div>
-                                </div>
-
                                 <div v-if="loadingComments" class="flex justify-center py-4">
                                     <div class="animate-spin rounded-full h-6 w-6 border-2 border-primary-500 border-t-transparent"></div>
                                 </div>
@@ -875,20 +866,57 @@
                                     暂无评论，快来抢沙发吧~
                                 </div>
                                 <div v-else class="space-y-4">
-                                    <div v-for="comment in comments" :key="comment.id" class="bg-gray-50 rounded-2xl p-4 border border-gray-100" :class="{ 'ring-1 ring-orange-200': comment.is_hot }">
+                                    <div v-for="root in commentTree" :key="root.id" class="bg-gray-50 rounded-2xl p-4 border border-gray-100" :class="{ 'ring-1 ring-orange-200': root.is_hot }">
                                         <div class="flex justify-between items-start mb-1">
-                                            <div class="flex items-center gap-2">
-                                                <span class="text-xs font-bold text-primary-600">{{ comment.author_name || comment.nickname }}</span>
-                                                <span class="text-[10px] text-gray-400">{{ formatDate(comment.created_at) }}</span>
-                                                <span v-if="comment.is_hot" class="text-[10px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded-md border border-orange-100">🔥热门</span>
+                                            <div class="flex items-center gap-2 flex-wrap">
+                                                <span class="text-xs font-bold text-primary-600">{{ root.author_name || root.nickname }}</span>
+                                                <span v-if="root.user_id && selectedCard && root.user_id === selectedCard.uploader_user_id" class="text-[10px] font-bold text-white bg-primary-500 px-1.5 py-0.5 rounded-md">作者</span>
+                                                <span class="text-[10px] text-gray-400">{{ formatDate(root.created_at) }}</span>
+                                                <span v-if="root.is_hot" class="text-[10px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded-md border border-orange-100">🔥热门</span>
                                             </div>
-                                            <button v-if="isAdmin" @click="deleteComment(comment.id)" class="text-xs text-red-400 hover:text-red-600">删除</button>
+                                            <button v-if="isAdmin" @click="deleteComment(root.id)" class="text-xs text-red-400 hover:text-red-600">删除</button>
                                         </div>
-                                        <p class="text-gray-600 text-sm leading-relaxed whitespace-pre-wrap mt-1">{{ comment.content }}</p>
+                                        <p class="text-gray-600 text-sm leading-relaxed whitespace-pre-wrap mt-1">{{ root.content }}</p>
                                         <div class="flex items-center gap-3 mt-2">
-                                            <button @click="likeComment(comment)" class="flex items-center gap-1 text-xs transition-all active:scale-95" :class="comment.user_liked ? 'text-pink-500' : 'text-gray-400 hover:text-pink-400'">
-                                                <svg class="w-4 h-4" :fill="comment.user_liked ? 'currentColor' : 'none'" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
-                                                {{ comment.likes_count || 0 }}
+                                            <button @click="likeComment(root)" class="flex items-center gap-1 text-xs transition-all active:scale-95" :class="root.user_liked ? 'text-pink-500' : 'text-gray-400 hover:text-pink-400'">
+                                                <svg class="w-4 h-4" :fill="root.user_liked ? 'currentColor' : 'none'" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
+                                                {{ root.likes_count || 0 }}
+                                            </button>
+                                            <button @click="replyToComment(root)" class="flex items-center gap-1 text-xs text-gray-400 hover:text-primary-500 transition-all active:scale-95">
+                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"></path></svg>
+                                                回复
+                                            </button>
+                                        </div>
+                                        <!-- Nested replies -->
+                                        <div v-if="root.replies.length > 0" class="mt-3 border-t border-gray-100 pt-3">
+                                            <div class="space-y-2 pl-3 border-l-2 border-primary-100">
+                                                <div v-for="reply in (expandedComments.has(root.id) ? root.replies : root.replies.slice(0, 2))" :key="reply.id" class="bg-white rounded-xl p-3 border border-gray-50">
+                                                    <div class="flex justify-between items-start mb-1">
+                                                        <div class="flex items-center gap-1.5 flex-wrap">
+                                                            <span class="text-xs font-bold text-primary-600">{{ reply.author_name || reply.nickname }}</span>
+                                                            <span v-if="reply.user_id && selectedCard && reply.user_id === selectedCard.uploader_user_id" class="text-[10px] font-bold text-white bg-primary-500 px-1.5 py-0.5 rounded-md">作者</span>
+                                                            <span v-if="reply.reply_to_name" class="text-[10px] text-gray-400">回复 <span class="font-bold text-primary-500">{{ reply.reply_to_name }}</span></span>
+                                                            <span class="text-[10px] text-gray-400">{{ formatDate(reply.created_at) }}</span>
+                                                            <span v-if="reply.is_hot" class="text-[10px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded-md border border-orange-100">🔥热门</span>
+                                                        </div>
+                                                        <button v-if="isAdmin" @click="deleteComment(reply.id)" class="text-xs text-red-400 hover:text-red-600">删除</button>
+                                                    </div>
+                                                    <p class="text-gray-600 text-sm leading-relaxed whitespace-pre-wrap mt-1">{{ reply.content }}</p>
+                                                    <div class="flex items-center gap-3 mt-1.5">
+                                                        <button @click="likeComment(reply)" class="flex items-center gap-1 text-xs transition-all active:scale-95" :class="reply.user_liked ? 'text-pink-500' : 'text-gray-400 hover:text-pink-400'">
+                                                            <svg class="w-3.5 h-3.5" :fill="reply.user_liked ? 'currentColor' : 'none'" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
+                                                            {{ reply.likes_count || 0 }}
+                                                        </button>
+                                                        <button @click="replyToComment(reply)" class="flex items-center gap-1 text-xs text-gray-400 hover:text-primary-500 transition-all active:scale-95">
+                                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"></path></svg>
+                                                            回复
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <button v-if="root.replies.length > 2" @click="toggleReplies(root.id)" class="text-xs text-primary-500 font-bold mt-2 flex items-center gap-1 hover:text-primary-600 transition-colors pl-3">
+                                                <svg class="w-3 h-3 transition-transform" :class="expandedComments.has(root.id) ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                                {{ expandedComments.has(root.id) ? '收起回复' : '展开更多 ' + (root.replies.length - 2) + ' 条回复' }}
                                             </button>
                                         </div>
                                     </div>
@@ -915,8 +943,11 @@
             <div class="hidden md:flex bg-white w-full h-auto max-h-[90vh] max-w-6xl rounded-[2.5rem] flex-row shadow-2xl overflow-hidden animate-scale-in relative">
                 
                 <!-- Left: Image Section -->
-                <div class="relative w-2/5 h-auto flex-shrink-0 bg-gray-100 group/img">
-                    <img :src="selectedCard.avatar_url || selectedCard.avatar || defaultAvatar" class="absolute inset-0 w-full h-full object-cover object-top transition-transform duration-700 group-hover/img:scale-105">
+                <div class="relative w-2/5 h-auto flex-shrink-0 bg-gray-100">
+                    <div class="absolute inset-0 flex items-center justify-center">
+                        <div class="animate-spin rounded-full h-8 w-8 border-3 border-primary-300 border-t-transparent"></div>
+                    </div>
+                    <img :src="selectedCard.avatar_url || selectedCard.avatar || defaultAvatar" class="absolute inset-0 w-full h-full object-cover object-top transition-opacity duration-300" @load="$event.target.style.opacity = 1" @error="if (!$event.target.dataset.fallback) { $event.target.dataset.fallback = '1'; $event.target.src = defaultAvatar; $event.target.style.opacity = 1 }" style="opacity: 0">
                 </div>
 
                 <!-- Right: Content Section -->
@@ -989,43 +1020,23 @@
                                 
                                 <div class="bg-gray-50 rounded-2xl p-4 mb-6 border border-gray-100">
                                     <div class="flex flex-col gap-3">
-                                        <textarea v-model="newComment.content" rows="3" :placeholder="isLoggedIn ? '写下你的评论（至少5个字）...' : '请先登录后再评论...'" class="bg-white border border-gray-200 rounded-xl px-4 py-3 text-sm focus:border-primary-500 outline-none transition-colors resize-none" :disabled="!isLoggedIn"></textarea>
+                                        <div v-if="newComment.reply_to_id" class="flex items-center gap-2 text-xs text-primary-600 bg-primary-50 px-3 py-1.5 rounded-lg">
+                                            <span>回复 <b>{{ newComment.reply_to_name }}</b></span>
+                                            <button @click="cancelReply" class="text-gray-400 hover:text-gray-600 ml-auto">&times;</button>
+                                        </div>
+                                        <textarea v-model="newComment.content" rows="3" :placeholder="newComment.reply_to_id ? '写下你的回复...' : (isLoggedIn ? '写下你的评论（至少5个字）...' : '请先登录后再评论...')" class="bg-white border border-gray-200 rounded-xl px-4 py-3 text-sm focus:border-primary-500 outline-none transition-colors resize-none" :disabled="!isLoggedIn"></textarea>
                                         <div class="flex items-center justify-between">
                                             <span v-if="!isLoggedIn" class="text-xs text-gray-400">
                                                 <button @click="showUserAuthModal = true; userAuthMode = 'login'" class="text-primary-600 font-bold hover:underline">登录</button>
-                                                后即可评论，每条评论可获得 1 次下载机会
+                                                后即可评论
                                             </span>
-                                            <span v-else class="text-xs text-gray-400">每条评论（≥5字）可获得 1 次下载机会</span>
+                                            <span v-else class="text-xs text-gray-400">每条评论（≥5字）可获得 2 次下载机会</span>
                                             <button @click="submitComment" :disabled="!isLoggedIn" class="bg-primary-600 text-white px-6 py-2 rounded-xl text-sm font-bold shadow-md shadow-primary-200 active:scale-95 transition-all disabled:opacity-50">发布</button>
                                         </div>
                                     </div>
                                 </div>
 
                                 <!-- Hot Comment -->
-                                <div v-if="comments.find(c => c.is_hot)" class="mb-4">
-                                    <div class="bg-gradient-to-r from-orange-50 to-yellow-50 rounded-2xl p-4 border border-orange-100 relative overflow-hidden">
-                                        <div class="absolute top-2 right-2 bg-orange-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full flex items-center gap-1">
-                                            <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path d="M12.395 2.553a1 1 0 00-1.45-.385c-.345.23-.614.558-.822.88-.214.33-.403.713-.57 1.116-.334.804-.614 1.768-.84 2.734a31.365 31.365 0 00-.613 3.58 2.64 2.64 0 01-.945-1.067c-.328-.68-.398-1.534-.398-2.654A1 1 0 005.05 6.05 6.981 6.981 0 003 11a7 7 0 1011.95-4.95c-.592-.591-.98-.985-1.348-1.467-.363-.476-.724-1.063-1.207-2.03zM12.12 15.12A3 3 0 017 13s.879.5 2.5.5c0-1 .5-4 1.25-4.5.5 1 .786 1.293 1.371 1.879A2.99 2.99 0 0113 13a2.99 2.99 0 01-.879 2.121z"></path></svg>
-                                            热门
-                                        </div>
-                                        <template v-for="comment in comments" :key="'hot2-' + comment.id">
-                                            <div v-if="comment.is_hot">
-                                                <div class="flex items-center gap-2 mb-2">
-                                                    <span class="text-xs font-bold text-orange-600">{{ comment.author_name || comment.nickname }}</span>
-                                                    <span class="text-[10px] text-orange-400">{{ formatDate(comment.created_at) }}</span>
-                                                </div>
-                                                <p class="text-gray-700 text-sm leading-relaxed whitespace-pre-wrap">{{ comment.content }}</p>
-                                                <div class="flex items-center gap-2 mt-2">
-                                                    <button @click="likeComment(comment)" class="flex items-center gap-1 text-xs transition-all" :class="comment.user_liked ? 'text-pink-500' : 'text-gray-400 hover:text-pink-400'">
-                                                        <svg class="w-4 h-4" :fill="comment.user_liked ? 'currentColor' : 'none'" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
-                                                        {{ comment.likes_count || 0 }}
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        </template>
-                                    </div>
-                                </div>
-
                                 <div v-if="loadingComments" class="flex justify-center py-4">
                                     <div class="animate-spin rounded-full h-6 w-6 border-2 border-primary-500 border-t-transparent"></div>
                                 </div>
@@ -1033,20 +1044,57 @@
                                     暂无评论，快来抢沙发吧~
                                 </div>
                                 <div v-else class="space-y-4">
-                                    <div v-for="comment in comments" :key="comment.id" class="bg-gray-50 rounded-2xl p-4 border border-gray-100" :class="{ 'ring-1 ring-orange-200': comment.is_hot }">
+                                    <div v-for="root in commentTree" :key="'dt-' + root.id" class="bg-gray-50 rounded-2xl p-4 border border-gray-100" :class="{ 'ring-1 ring-orange-200': root.is_hot }">
                                         <div class="flex justify-between items-start mb-1">
-                                            <div class="flex items-center gap-2">
-                                                <span class="text-xs font-bold text-primary-600">{{ comment.author_name || comment.nickname }}</span>
-                                                <span class="text-[10px] text-gray-400">{{ formatDate(comment.created_at) }}</span>
-                                                <span v-if="comment.is_hot" class="text-[10px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded-md border border-orange-100">🔥热门</span>
+                                            <div class="flex items-center gap-2 flex-wrap">
+                                                <span class="text-xs font-bold text-primary-600">{{ root.author_name || root.nickname }}</span>
+                                                <span v-if="root.user_id && selectedCard && root.user_id === selectedCard.uploader_user_id" class="text-[10px] font-bold text-white bg-primary-500 px-1.5 py-0.5 rounded-md">作者</span>
+                                                <span class="text-[10px] text-gray-400">{{ formatDate(root.created_at) }}</span>
+                                                <span v-if="root.is_hot" class="text-[10px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded-md border border-orange-100">🔥热门</span>
                                             </div>
-                                            <button v-if="isAdmin" @click="deleteComment(comment.id)" class="text-xs text-red-400 hover:text-red-600">删除</button>
+                                            <button v-if="isAdmin" @click="deleteComment(root.id)" class="text-xs text-red-400 hover:text-red-600">删除</button>
                                         </div>
-                                        <p class="text-gray-600 text-sm leading-relaxed whitespace-pre-wrap mt-1">{{ comment.content }}</p>
+                                        <p class="text-gray-600 text-sm leading-relaxed whitespace-pre-wrap mt-1">{{ root.content }}</p>
                                         <div class="flex items-center gap-3 mt-2">
-                                            <button @click="likeComment(comment)" class="flex items-center gap-1 text-xs transition-all active:scale-95" :class="comment.user_liked ? 'text-pink-500' : 'text-gray-400 hover:text-pink-400'">
-                                                <svg class="w-4 h-4" :fill="comment.user_liked ? 'currentColor' : 'none'" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
-                                                {{ comment.likes_count || 0 }}
+                                            <button @click="likeComment(root)" class="flex items-center gap-1 text-xs transition-all active:scale-95" :class="root.user_liked ? 'text-pink-500' : 'text-gray-400 hover:text-pink-400'">
+                                                <svg class="w-4 h-4" :fill="root.user_liked ? 'currentColor' : 'none'" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
+                                                {{ root.likes_count || 0 }}
+                                            </button>
+                                            <button @click="replyToComment(root)" class="flex items-center gap-1 text-xs text-gray-400 hover:text-primary-500 transition-all active:scale-95">
+                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"></path></svg>
+                                                回复
+                                            </button>
+                                        </div>
+                                        <!-- Nested replies -->
+                                        <div v-if="root.replies.length > 0" class="mt-3 border-t border-gray-100 pt-3">
+                                            <div class="space-y-2 pl-3 border-l-2 border-primary-100">
+                                                <div v-for="reply in (expandedComments.has(root.id) ? root.replies : root.replies.slice(0, 2))" :key="'dt-r-' + reply.id" class="bg-white rounded-xl p-3 border border-gray-50">
+                                                    <div class="flex justify-between items-start mb-1">
+                                                        <div class="flex items-center gap-1.5 flex-wrap">
+                                                            <span class="text-xs font-bold text-primary-600">{{ reply.author_name || reply.nickname }}</span>
+                                                            <span v-if="reply.user_id && selectedCard && reply.user_id === selectedCard.uploader_user_id" class="text-[10px] font-bold text-white bg-primary-500 px-1.5 py-0.5 rounded-md">作者</span>
+                                                            <span v-if="reply.reply_to_name" class="text-[10px] text-gray-400">回复 <span class="font-bold text-primary-500">{{ reply.reply_to_name }}</span></span>
+                                                            <span class="text-[10px] text-gray-400">{{ formatDate(reply.created_at) }}</span>
+                                                            <span v-if="reply.is_hot" class="text-[10px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded-md border border-orange-100">🔥热门</span>
+                                                        </div>
+                                                        <button v-if="isAdmin" @click="deleteComment(reply.id)" class="text-xs text-red-400 hover:text-red-600">删除</button>
+                                                    </div>
+                                                    <p class="text-gray-600 text-sm leading-relaxed whitespace-pre-wrap mt-1">{{ reply.content }}</p>
+                                                    <div class="flex items-center gap-3 mt-1.5">
+                                                        <button @click="likeComment(reply)" class="flex items-center gap-1 text-xs transition-all active:scale-95" :class="reply.user_liked ? 'text-pink-500' : 'text-gray-400 hover:text-pink-400'">
+                                                            <svg class="w-3.5 h-3.5" :fill="reply.user_liked ? 'currentColor' : 'none'" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
+                                                            {{ reply.likes_count || 0 }}
+                                                        </button>
+                                                        <button @click="replyToComment(reply)" class="flex items-center gap-1 text-xs text-gray-400 hover:text-primary-500 transition-all active:scale-95">
+                                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"></path></svg>
+                                                            回复
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <button v-if="root.replies.length > 2" @click="toggleReplies(root.id)" class="text-xs text-primary-500 font-bold mt-2 flex items-center gap-1 hover:text-primary-600 transition-colors pl-3">
+                                                <svg class="w-3 h-3 transition-transform" :class="expandedComments.has(root.id) ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                                {{ expandedComments.has(root.id) ? '收起回复' : '展开更多 ' + (root.replies.length - 2) + ' 条回复' }}
                                             </button>
                                         </div>
                                     </div>
@@ -1139,6 +1187,7 @@
                 
                 const cards = ref([]);
                 const cardSort = ref('latest');
+                const showSortDropdown = ref(false);
                 const loading = ref(true);
                 const searchQuery = ref('');
                 const currentTab = ref('all');
@@ -1167,8 +1216,49 @@
                 const comments = ref([]);
                 const loadingComments = ref(false);
                 const newComment = reactive({
-                    content: ''
+                    content: '',
+                    reply_to_id: null,
+                    reply_to_name: ''
                 });
+                const expandedComments = ref(new Set());
+
+                const commentTree = computed(() => {
+                    const all = comments.value;
+                    const byId = {};
+                    all.forEach(c => byId[c.id] = c);
+                    // Find root ancestor of a comment
+                    function findRoot(c, visited) {
+                        if (!c.reply_to_id) return c.id;
+                        if (visited.has(c.id)) return c.id;
+                        visited.add(c.id);
+                        const parent = byId[c.reply_to_id];
+                        if (!parent) return c.id;
+                        return findRoot(parent, visited);
+                    }
+                    const roots = [];
+                    const repliesMap = {};
+                    all.forEach(c => {
+                        if (!c.reply_to_id) {
+                            roots.push(c);
+                            if (!repliesMap[c.id]) repliesMap[c.id] = [];
+                        } else {
+                            const rootId = findRoot(c, new Set());
+                            if (!repliesMap[rootId]) repliesMap[rootId] = [];
+                            repliesMap[rootId].push(c);
+                        }
+                    });
+                    return roots.map(r => ({
+                        ...r,
+                        replies: repliesMap[r.id] || []
+                    }));
+                });
+
+                const toggleReplies = (commentId) => {
+                    const s = new Set(expandedComments.value);
+                    if (s.has(commentId)) s.delete(commentId);
+                    else s.add(commentId);
+                    expandedComments.value = s;
+                };
 
                 // Admin Logic - JWT-based authentication
                 const isAdmin = ref(false);
@@ -1478,10 +1568,9 @@
                         // Process tags for each card
                         cards.value = (data || []).map(card => {
                             parseCreatorNotes(card);
-                            // 列表不返回avatar_url，使用图片接口URL
-                            if (!card.avatar_url) {
-                                card.avatar_url = API_BASE + '/api/cards/' + card.id + '/avatar';
-                            }
+                            // 列表使用缩略图URL，详情使用完整图
+                            card.thumbnail_url = API_BASE + '/api/cards/' + card.id + '/thumbnail';
+                            card.avatar_url = API_BASE + '/api/cards/' + card.id + '/avatar';
                             return card;
                         });
                     } catch (err) {
@@ -1774,9 +1863,10 @@
                     if (!confirm(`确定要删除角色卡 "${card.name}" 吗？此操作无法撤销。`)) return;
                     
                     try {
+                        const headers = isAdmin.value ? adminAuthHeaders() : userAuthHeaders();
                         const resp = await fetch(API_BASE + '/api/cards/' + card.id, {
                             method: 'DELETE',
-                            headers: adminAuthHeaders()
+                            headers
                         });
                         const data = await resp.json();
                             
@@ -1795,6 +1885,8 @@
                             myUploadedIds.value = myUploadedIds.value.filter(id => id !== card.id);
                             safeStorage.setItem('my_uploaded_ids', JSON.stringify(myUploadedIds.value));
                         }
+                        // Refresh user credits (server deducted 3)
+                        await refreshUserCredits();
                         
                         showToast('删除成功', 'success');
                     } catch (err) {
@@ -2146,7 +2238,7 @@
                         const resp = await fetch(API_BASE + '/api/cards/' + selectedCard.value.id + '/comments', {
                             method: 'POST',
                             headers: userAuthHeaders(),
-                            body: JSON.stringify({ content: newComment.content.trim() })
+                            body: JSON.stringify({ content: newComment.content.trim(), reply_to_id: newComment.reply_to_id || undefined })
                         });
                         if (!resp.ok) {
                             const err = await resp.json();
@@ -2156,6 +2248,23 @@
 
                         if (data && data.comment) {
                             comments.value.push(data.comment);
+                            // Auto-expand replies for the root comment this reply belongs to
+                            if (data.comment.reply_to_id) {
+                                const byId = {};
+                                comments.value.forEach(c => byId[c.id] = c);
+                                function findRoot(c, visited) {
+                                    if (!c.reply_to_id) return c.id;
+                                    if (visited.has(c.id)) return c.id;
+                                    visited.add(c.id);
+                                    const parent = byId[c.reply_to_id];
+                                    if (!parent) return c.id;
+                                    return findRoot(parent, visited);
+                                }
+                                const rootId = findRoot(data.comment, new Set());
+                                const s = new Set(expandedComments.value);
+                                s.add(rootId);
+                                expandedComments.value = s;
+                            }
                         }
                         
                         // Update credits from server response
@@ -2163,11 +2272,30 @@
                             currentUser.value = { ...currentUser.value, download_credits: data.new_credits };
                         }
                         newComment.content = '';
+                        newComment.reply_to_id = null;
+                        newComment.reply_to_name = '';
                             showToast('评论发布成功！获得 2 次下载机会', 'success');
                     } catch (err) {
                         console.error('Error submitting comment:', err);
                         showToast('评论失败: ' + err.message, 'error');
                     }
+                };
+
+                const replyToComment = (comment) => {
+                    if (!isLoggedIn.value) {
+                        showUserAuthModal.value = true;
+                        userAuthMode.value = 'login';
+                        showToast('请先登录后再回复', 'warning');
+                        return;
+                    }
+                    newComment.reply_to_id = comment.id;
+                    newComment.reply_to_name = comment.author_name || comment.nickname;
+                    newComment.content = '';
+                };
+
+                const cancelReply = () => {
+                    newComment.reply_to_id = null;
+                    newComment.reply_to_name = '';
                 };
 
                 const likeCard = async (card) => {
@@ -2231,9 +2359,8 @@
                         });
                         
                         // Update credits if liked (not unliked)
-                        if (data.liked && data.new_credits !== undefined && currentUser.value) {
-                            currentUser.value = { ...currentUser.value, download_credits: data.new_credits };
-                            showToast('点赞成功！获得 1 次下载机会', 'success');
+                        if (data.liked) {
+                            showToast('点赞成功', 'success');
                         } else if (!data.liked) {
                             showToast('已取消点赞', 'info');
                         }
@@ -2516,14 +2643,20 @@
                     isEditUploading.value = true;
                     try {
                         const headers = isLoggedIn.value ? userAuthHeaders() : adminAuthHeaders();
+                        const editPayload = {
+                            name: editingCard.value.name,
+                            description: editingCard.value.description,
+                            data: editingCard.value.full_data,
+                            creator_notes: editingCard.value.creator_notes
+                        };
+                        // 仅当头像是新上传的 data URL 时才发送，避免将 API 端点 URL 写回数据库
+                        if (editingCard.value.avatar_url && editingCard.value.avatar_url.startsWith('data:')) {
+                            editPayload.avatar_url = editingCard.value.avatar_url;
+                        }
                         const resp = await fetch(API_BASE + '/api/cards/' + editingCard.value.id, {
                             method: 'PUT',
                             headers: headers,
-                            body: JSON.stringify({
-                                avatar_url: editingCard.value.avatar_url,
-                                data: editingCard.value.full_data,
-                                creator_notes: editingCard.value.creator_notes
-                            })
+                            body: JSON.stringify(editPayload)
                         });
                         if (!resp.ok) {
                             const err = await resp.json().catch(() => ({}));
@@ -2608,6 +2741,7 @@
                     trackVisit();
                     fetchVisits();
                     window.addEventListener('resize', handleWindowResize);
+                    document.addEventListener('click', () => { showSortDropdown.value = false; });
                     window.addEventListener('message', (event) => {
                         if (event.data && event.data.type === 'slash_command') {
                             showToast(`触发指令：${event.data.content}`, 'success');
@@ -2620,14 +2754,15 @@
                 });
 
                 return {
-                    cards, cardSort, loading, searchQuery, filteredCards, pagedCards, defaultAvatar,
+                    cards, cardSort, showSortDropdown, loading, searchQuery, filteredCards, pagedCards, defaultAvatar,
                     showUploadModal, showSearchModal, uploadingCard, isUploading, handleFileSelect, confirmUpload, handleUploadClick,
                     selectedCard, previewCard, formatDate, downloadCard, deleteCard, moveCard,
                     toasts, currentTab, myUploadedIds, popularTags, visiblePopularTags, showPopularTagsToggle, modalPopularTags, searchTag,
                     mobileScrollBlur, handleMobileScroll,
                     isAdmin, handleLogoClick, handleAdminLogout, renderMarkdown,
                     showAdminLogin, adminLoginForm, adminLoginError, handleAdminLogin,
-                    comments, loadingComments, newComment, submitComment, deleteComment, likeComment, likeCard,
+                    comments, loadingComments, newComment, submitComment, deleteComment, likeComment, likeCard, replyToComment, cancelReply,
+                    commentTree, expandedComments, toggleReplies,
                     downloadCredits,
                     // User Auth
                     isLoggedIn, currentUser, showUserAuthModal, userAuthMode, userAuthForm, userAuthError,
