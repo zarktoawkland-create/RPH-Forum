@@ -1,9 +1,9 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <!-- 禁止缓存，确保用户始终加载最新的 UI 逻辑 -->
+    <!-- Disable HTML caching so clients always receive the latest UI logic. -->
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
@@ -760,6 +760,24 @@
             </div>
         </div>
 
+        <div v-if="previewOpening.active" class="fixed inset-0 z-[60] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in">
+            <div class="w-full max-w-sm rounded-[2rem] overflow-hidden bg-white shadow-2xl border border-white/60">
+                <div class="aspect-[3/4] bg-gray-100 relative overflow-hidden">
+                    <img :src="previewOpening.imageUrl || defaultAvatar" class="absolute inset-0 w-full h-full object-cover" />
+                    <div class="absolute inset-0 bg-gradient-to-t from-black/45 via-black/10 to-transparent"></div>
+                    <div class="absolute inset-0 flex items-center justify-center">
+                        <div class="rounded-full bg-white/20 backdrop-blur-md p-4 border border-white/30">
+                            <div class="animate-spin rounded-full h-10 w-10 border-4 border-white/70 border-t-transparent"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="px-6 py-5 text-center">
+                    <h3 class="text-xl font-black text-gray-900 truncate">{{ previewOpening.name }}</h3>
+                    <p class="mt-2 text-sm text-gray-500">正在进入详情页并准备资源，请稍候。</p>
+                </div>
+            </div>
+        </div>
+
         <!-- Preview Modal (Full Screen Mobile Scroll & Parallax) -->
         <div v-if="selectedCard" class="fixed inset-0 z-50 flex md:items-center justify-center bg-black/60 animate-fade-in md:p-4 md:backdrop-blur-sm md:transition-all md:duration-300">
             
@@ -768,21 +786,23 @@
                  @scroll="handleMobileScroll">
                 
                 <!-- Close Button -->
-                <button @click="selectedCard = null" class="fixed top-4 right-4 z-50 bg-black/30 text-white p-2.5 rounded-full backdrop-blur-md border border-white/20 active:scale-95 transition-transform">
+                <button @click="selectedCard = null; stopPreviewOpening()" class="fixed top-4 right-4 z-50 bg-black/30 text-white p-2.5 rounded-full backdrop-blur-md border border-white/20 active:scale-95 transition-transform">
                     <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
                 </button>
 
                 <!-- Fixed Background Image -->
                 <div class="fixed top-0 left-0 w-full h-[80vh] z-0 overflow-hidden bg-gray-900">
-                    <div class="absolute inset-0 flex items-center justify-center">
-                        <div class="animate-spin rounded-full h-8 w-8 border-3 border-white/50 border-t-transparent"></div>
-                    </div>
-                    <img :src="selectedCard.avatar_url || selectedCard.avatar || defaultAvatar"
+                    <img :src="previewAsset.imageUrl || selectedCard.thumbnail_url || selectedCard.avatar_url || selectedCard.avatar || defaultAvatar"
                          id="mobile-bg-img"
                          class="w-full h-full object-cover object-top mobile-bg-img"
-                         @load="$event.target.style.opacity = 1"
-                         @error="if (!$event.target.dataset.fallback) { $event.target.dataset.fallback = 'thumbnail'; $event.target.src = selectedCard.thumbnail_url || defaultAvatar; $event.target.style.opacity = 1 } else if ($event.target.dataset.fallback === 'thumbnail') { $event.target.dataset.fallback = 'default'; $event.target.src = defaultAvatar; $event.target.style.opacity = 1 }"
-                         style="opacity: 0">
+                         style="opacity: 1">
+                    <div v-if="previewAsset.loading" class="absolute inset-0 bg-black/30 backdrop-blur-[2px] flex items-center justify-center px-6">
+                        <div class="max-w-xs text-center text-white">
+                            <div class="mx-auto mb-4 animate-spin rounded-full h-10 w-10 border-4 border-white/50 border-t-transparent"></div>
+                            <p class="text-base font-bold">正在加载原图</p>
+                            <p class="mt-2 text-sm text-white/80 leading-relaxed">原图或内嵌 UI 可能较复杂，网络较慢时需要等待几秒，请稍候。</p>
+                        </div>
+                    </div>
                     <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/20"></div>
                 </div>
 
@@ -802,15 +822,34 @@
                         <!-- Title & Meta -->
                         <div class="mb-8">
                             <h2 class="text-3xl font-black text-gray-900 tracking-tight leading-tight">{{ selectedCard.name }}</h2>
+                            <div v-if="previewAsset.error || selectedCardHasComplexUi" class="mt-4 text-sm rounded-2xl border px-4 py-3"
+                                 :class="previewAsset.error ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-slate-50 text-slate-600 border-slate-200'">
+                                {{ previewAsset.error || '这张角色卡可能包含较复杂的原图或内嵌 UI，首次打开与下载前请等待资源准备完成。' }}
+                            </div>
                             <div v-if="selectedCard.creator_notes" class="mt-4 p-4 bg-blue-50/50 rounded-2xl border border-blue-100 text-blue-800 text-sm leading-relaxed flex items-start gap-3">
                                 <svg class="w-5 h-5 text-blue-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                                 <div class="flex-1 flex flex-col gap-2">
                                     <div v-if="selectedCard.clean_notes">{{ selectedCard.clean_notes }}</div>
-                                    <div v-if="selectedCard.tags && selectedCard.tags.length > 0" class="flex flex-nowrap overflow-x-auto gap-2 no-scrollbar">
-                                        <span v-for="tag in selectedCard.tags" :key="tag"
-                                              class="px-2 py-1 rounded-lg text-xs font-bold border border-blue-200 bg-blue-50 text-blue-600 flex-shrink-0">
-                                            {{ tag }}
-                                        </span>
+                                    <div v-if="selectedCard.tags && selectedCard.tags.length > 0" class="overflow-hidden rounded-2xl border border-blue-100/80 bg-white/70">
+                                        <button @click="mobileDetailTagsExpanded = !mobileDetailTagsExpanded" class="w-full p-3 text-left">
+                                            <div class="flex items-start justify-between gap-3">
+                                                <div class="flex-1 min-w-0 overflow-hidden">
+                                                    <div class="flex flex-wrap gap-2 overflow-hidden">
+                                                        <span v-for="tag in mobileDetailVisibleTags" :key="tag"
+                                                              class="max-w-full break-all px-2 py-1 rounded-lg text-xs font-bold border border-blue-200 bg-blue-50 text-blue-600">
+                                                            {{ tag }}
+                                                        </span>
+                                                        <span v-if="mobileDetailHiddenTagCount > 0 && !mobileDetailTagsExpanded"
+                                                              class="px-2 py-1 rounded-lg text-xs font-bold border border-blue-200 bg-blue-100 text-blue-700">
+                                                            +{{ mobileDetailHiddenTagCount }}
+                                                        </span>
+                                                    </div>
+                                                </div>
+                                                <span class="flex-shrink-0 text-[11px] font-bold tracking-wide text-blue-500 mt-0.5">
+                                                    {{ mobileDetailTagsExpanded ? '收起' : '展开' }}
+                                                </span>
+                                            </div>
+                                        </button>
                                     </div>
                                 </div>
                             </div>
@@ -842,7 +881,7 @@
                                     开场白
                                     <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
                                 </h4>
-                                <!-- 添加 key 强制重新渲染，确保每次打开都重新加载 iframe -->
+                                <!-- Force iframe remounting so each open starts from a clean render state. -->
                                 <div :key="selectedCard.renderId" class="text-gray-700 prose prose-lg max-w-none leading-relaxed tracking-normal break-words" v-html="renderMarkdown(selectedCard._display.first_mes)"></div>
                             </section>
 
@@ -943,9 +982,11 @@
 
                 <!-- Fixed Footer Actions (Mobile) -->
                 <div class="fixed bottom-0 left-0 w-full p-4 bg-white/90 backdrop-blur-md border-t border-gray-100 z-50 flex gap-3 safe-area-pb">
-                     <button @click="downloadCard(selectedCard)" class="flex-1 bg-gray-900 hover:bg-black text-white py-3.5 rounded-2xl font-bold shadow-lg flex items-center justify-center gap-2 active:scale-[0.98]">
+                     <button @click="downloadCard(selectedCard)" :disabled="!canDownloadSelectedCard"
+                             class="flex-1 py-3.5 rounded-2xl font-bold shadow-lg flex items-center justify-center gap-2 transition-all"
+                             :class="canDownloadSelectedCard ? 'bg-gray-900 hover:bg-black text-white active:scale-[0.98]' : 'bg-gray-200 text-gray-500 cursor-not-allowed'">
                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
-                        下载角色卡
+                        {{ downloadButtonLabel }}
                     </button>
                     <button v-if="(isLoggedIn && currentUser && selectedCard.uploader_user_id === currentUser.id) || isAdmin" @click="deleteCard(selectedCard); selectedCard = null" class="w-14 bg-red-50 text-red-500 rounded-2xl flex items-center justify-center">
                         <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
@@ -958,17 +999,21 @@
                 
                 <!-- Left: Image Section -->
                 <div class="relative w-2/5 h-auto flex-shrink-0 bg-gray-100">
-                    <div class="absolute inset-0 flex items-center justify-center">
-                        <div class="animate-spin rounded-full h-8 w-8 border-3 border-primary-300 border-t-transparent"></div>
+                    <div v-if="previewAsset.loading" class="absolute inset-0 z-10 bg-white/70 backdrop-blur-[2px] flex items-center justify-center px-6">
+                        <div class="max-w-xs text-center text-gray-700">
+                            <div class="mx-auto mb-4 animate-spin rounded-full h-10 w-10 border-4 border-primary-300 border-t-transparent"></div>
+                            <p class="text-lg font-bold">正在加载原图</p>
+                            <p class="mt-2 text-sm text-gray-500 leading-relaxed">原图或内嵌 UI 可能较复杂，网络较慢时需要等待，请稍候。</p>
+                        </div>
                     </div>
-                    <img :src="selectedCard.avatar_url || selectedCard.avatar || defaultAvatar" class="absolute inset-0 w-full h-full object-cover object-top transition-opacity duration-300" @load="$event.target.style.opacity = 1" @error="if (!$event.target.dataset.fallback) { $event.target.dataset.fallback = '1'; $event.target.src = defaultAvatar; $event.target.style.opacity = 1 }" style="opacity: 0">
+                    <img :src="previewAsset.imageUrl || selectedCard.thumbnail_url || selectedCard.avatar_url || selectedCard.avatar || defaultAvatar" class="absolute inset-0 w-full h-full object-cover object-top transition-opacity duration-300" style="opacity: 1">
                 </div>
 
                 <!-- Right: Content Section -->
                 <div class="flex-1 flex flex-col min-h-0 bg-white p-10 lg:p-12">
                     
                     <!-- Close Button -->
-                    <button @click="selectedCard = null" class="absolute top-8 right-8 p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-full transition-all z-20">
+                    <button @click="selectedCard = null; stopPreviewOpening()" class="absolute top-8 right-8 p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-full transition-all z-20">
                         <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
                     </button>
 
@@ -978,6 +1023,10 @@
                         <!-- Title & Meta -->
                         <div class="mb-8">
                             <h2 class="text-3xl md:text-4xl font-black text-gray-900 tracking-tight leading-tight">{{ selectedCard.name }}</h2>
+                            <div v-if="previewAsset.error || selectedCardHasComplexUi" class="mt-4 text-sm rounded-2xl border px-4 py-3"
+                                 :class="previewAsset.error ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-slate-50 text-slate-600 border-slate-200'">
+                                {{ previewAsset.error || '这张角色卡可能包含较复杂的原图或内嵌 UI，首次打开与下载前请等待资源准备完成。' }}
+                            </div>
                             
                             <!-- Creator Notes Content (Visible in Preview) -->
                             <div v-if="selectedCard.creator_notes" class="mt-4 p-4 bg-blue-50/50 rounded-2xl border border-blue-100 text-blue-800 text-sm leading-relaxed flex items-start gap-3">
@@ -1020,7 +1069,7 @@
                                     开场白
                                     <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
                                 </h4>
-                                <!-- 添加 key 强制重新渲染，确保每次打开都重新加载 iframe -->
+                                <!-- Force iframe remounting so each open starts from a clean render state. -->
                                 <div :key="selectedCard.renderId" class="text-gray-700 prose prose-lg max-w-none leading-relaxed tracking-normal break-words" v-html="renderMarkdown(selectedCard._display.first_mes)"></div>
                             </section>
 
@@ -1119,9 +1168,11 @@
 
                     <!-- Footer Actions -->
                     <div class="pt-6 mt-4 border-t border-gray-100 md:pt-8 md:mt-0 flex gap-4 p-6 md:p-0 bg-white md:static sticky bottom-0 z-20 shadow-[0_-4px_20px_rgba(0,0,0,0.05)] md:shadow-none pb-8 md:pb-0 safe-area-pb flex-shrink-0">
-                        <button @click="downloadCard(selectedCard)" class="flex-1 bg-gray-900 hover:bg-black text-white py-4 md:py-5 rounded-2xl font-bold transition-all shadow-xl shadow-gray-200 flex items-center justify-center gap-3 active:scale-[0.98] group">
+                        <button @click="downloadCard(selectedCard)" :disabled="!canDownloadSelectedCard"
+                                class="flex-1 py-4 md:py-5 rounded-2xl font-bold transition-all shadow-xl flex items-center justify-center gap-3 group"
+                                :class="canDownloadSelectedCard ? 'bg-gray-900 hover:bg-black text-white shadow-gray-200 active:scale-[0.98]' : 'bg-gray-200 text-gray-500 shadow-transparent cursor-not-allowed'">
                             <svg class="w-5 h-5 md:w-6 md:h-6 transform transition-transform group-hover:translate-y-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
-                            下载角色卡
+                            {{ downloadButtonLabel }}
                         </button>
                         <button v-if="(isLoggedIn && currentUser && selectedCard.uploader_user_id === currentUser.id) || isAdmin" @click="deleteCard(selectedCard); selectedCard = null" class="w-14 bg-red-50 hover:bg-red-100 text-red-500 rounded-2xl flex items-center justify-center transition-colors">
                             <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
@@ -1206,15 +1257,36 @@
                 const searchQuery = ref('');
                 const currentTab = ref('all');
                 const myUploadedIds = ref(JSON.parse(safeStorage.getItem('my_uploaded_ids') || '[]'));
+                const configuredPopularTags = ref([]);
+                const configuredTagLibrary = ref([]);
+                const hiddenPopularTags = ref([]);
+                const hiddenTagLibrary = ref([]);
                 const downloadCredits = computed(() => currentUser.value ? currentUser.value.download_credits : parseInt(safeStorage.getItem('download_credits') || '0'));
                 const showUploadModal = ref(false);
                 const showSearchModal = ref(false);
                 const uploadingCard = ref(null);
                 const isUploading = ref(false);
                 const selectedCard = ref(null);
+                const mobileDetailTagsExpanded = ref(false);
+                const previewOpening = reactive({
+                    active: false,
+                    name: '',
+                    imageUrl: ''
+                });
+                const previewAsset = reactive({
+                    cardId: '',
+                    loading: false,
+                    ready: false,
+                    error: '',
+                    imageUrl: '',
+                    source: 'original',
+                    shouldRevoke: false
+                });
+                const isDownloadingCard = ref(false);
                 const toasts = ref([]);
                 const windowWidth = ref(window.innerWidth);
                 let mobileScrollTicking = false;
+                const PREVIEW_OPENING_MIN_MS = 220;
 
                 const handleMobileScroll = (e) => {
                     if (mobileScrollTicking) return;
@@ -1235,6 +1307,16 @@
 
                 const handleWindowResize = () => {
                     windowWidth.value = window.innerWidth;
+                };
+
+                const handleWindowFocus = () => {
+                    loadPublicSettings();
+                };
+
+                const handleVisibilityChange = () => {
+                    if (!document.hidden) {
+                        loadPublicSettings();
+                    }
                 };
 
                 // Comments Logic
@@ -1453,7 +1535,53 @@
                     safeStorage.setItem('download_credits', Math.max(0, cur + amount).toString());
                 };
 
+                const parseTagSetting = (value) => {
+                    if (!value) return [];
+                    if (Array.isArray(value)) {
+                        return [...new Set(value.map(item => String(item).trim()).filter(Boolean))];
+                    }
+                    const raw = String(value).trim();
+                    if (!raw) return [];
+                    try {
+                        const parsed = JSON.parse(raw);
+                        if (Array.isArray(parsed)) {
+                            return [...new Set(parsed.map(item => String(item).trim()).filter(Boolean))];
+                        }
+                    } catch (e) { /* ignore non-JSON input */ }
+                    return [...new Set(raw.split(/[\n,，]/).map(item => item.trim()).filter(Boolean))];
+                };
+
+                const applyPublicSettings = (settings) => {
+                    configuredPopularTags.value = parseTagSetting(settings.popular_tags);
+                    configuredTagLibrary.value = parseTagSetting(settings.tag_library);
+                    hiddenPopularTags.value = parseTagSetting(settings.hidden_popular_tags);
+                    hiddenTagLibrary.value = parseTagSetting(settings.hidden_tag_library);
+                };
+
+                const loadPublicSettings = async () => {
+                    try {
+                        const resp = await fetch(API_BASE + '/api/settings');
+                        if (!resp.ok) return;
+                        const data = await resp.json();
+                        applyPublicSettings(data || {});
+                    } catch (err) {
+                        console.error('Load public settings error:', err);
+                    }
+                };
+
+                const isCardOwnedByCurrentUser = (card) => {
+                    if (!card) return false;
+                    if (isLoggedIn.value && currentUser.value && card.uploader_user_id === currentUser.value.id) {
+                        return true;
+                    }
+                    return myUploadedIds.value.includes(card.id);
+                };
+
                 const popularTags = computed(() => {
+                    const hiddenSet = new Set(hiddenPopularTags.value);
+                    if (configuredPopularTags.value.length > 0) {
+                        return configuredPopularTags.value.filter(tag => !hiddenSet.has(tag));
+                    }
                     const tagCounts = {};
                     cards.value.forEach(card => {
                         if (card.tags && Array.isArray(card.tags)) {
@@ -1462,8 +1590,9 @@
                             });
                         }
                     });
-                    // 热门标签：按出现次数排序，取前 20
+                    // Rank fallback popular tags by occurrence count and keep the top 20.
                     return Object.entries(tagCounts)
+                        .filter(([tag]) => !hiddenSet.has(tag))
                         .sort((a, b) => b[1] - a[1])
                         .slice(0, 20)
                         .map(entry => entry[0]);
@@ -1473,6 +1602,12 @@
                     if (windowWidth.value < 640) return 3;
                     if (windowWidth.value < 1024) return 5;
                     return 8;
+                });
+
+                const mobileDetailCollapsedTagCount = computed(() => {
+                    if (windowWidth.value < 390) return 4;
+                    if (windowWidth.value < 640) return 5;
+                    return 6;
                 });
 
                 const visiblePopularTags = computed(() => {
@@ -1486,22 +1621,11 @@
                 });
 
                 const modalPopularTags = computed(() => {
-                    const tagCounts = {};
-                    cards.value.forEach(card => {
-                        if (card.tags && Array.isArray(card.tags)) {
-                            card.tags.forEach(tag => {
-                                if (tag) tagCounts[tag] = (tagCounts[tag] || 0) + 1;
-                            });
-                        }
-                    });
-                    // Search modal: also top 20
-                    return Object.entries(tagCounts)
-                        .sort((a, b) => b[1] - a[1])
-                        .slice(0, 20)
-                        .map(entry => entry[0]);
+                    return popularTags.value;
                 });
 
                 const allTags = computed(() => {
+                    const hiddenSet = new Set(hiddenTagLibrary.value);
                     const tagCounts = {};
                     cards.value.forEach(card => {
                         if (card.tags && Array.isArray(card.tags)) {
@@ -1510,9 +1634,18 @@
                             });
                         }
                     });
-                    return Object.entries(tagCounts)
-                        .sort((a, b) => b[1] - a[1])
-                        .map(([tag, count]) => ({ tag, count }));
+                    const ranked = Object.entries(tagCounts)
+                        .filter(([tag]) => !hiddenSet.has(tag))
+                        .sort((a, b) => b[1] - a[1]);
+                    if (configuredTagLibrary.value.length === 0) {
+                        return ranked.map(([tag, count]) => ({ tag, count }));
+                    }
+                    const visibleConfiguredTags = configuredTagLibrary.value.filter(tag => !hiddenSet.has(tag));
+                    const configuredSet = new Set(visibleConfiguredTags);
+                    return [
+                        ...visibleConfiguredTags.map(tag => ({ tag, count: tagCounts[tag] || 0 })),
+                        ...ranked.filter(([tag]) => !configuredSet.has(tag)).map(([tag, count]) => ({ tag, count }))
+                    ];
                 });
 
                 const searchTag = (tag) => {
@@ -1528,12 +1661,12 @@
 
                     // Tab filter
                     if (currentTab.value === 'mine') {
-                        result = result.filter(c => myUploadedIds.value.includes(c.id));
+                        result = result.filter(c => isCardOwnedByCurrentUser(c));
                     }
 
                     if (searchQuery.value) {
                         const q = searchQuery.value.toLowerCase();
-                        // Strip leading # so "#纯爱" matches tag "纯爱"
+                        // Strip a leading hash prefix before matching against tag text.
                         const tagQ = q.startsWith('#') ? q.slice(1) : q;
                         result = result.filter(c =>
                             c.name.toLowerCase().includes(q) ||
@@ -1593,7 +1726,7 @@
                         // Process tags for each card
                         cards.value = (data || []).map(card => {
                             parseCreatorNotes(card);
-                            // 列表使用缩略图URL，详情使用完整图
+                            // Use the lightweight thumbnail in lists and the full asset in detail view.
                             card.thumbnail_url = API_BASE + '/api/cards/' + card.id + '/thumbnail';
                             card.avatar_url = API_BASE + '/api/cards/' + card.id + '/avatar';
                             return card;
@@ -1606,6 +1739,96 @@
                     }
                 };
 
+                const clearPreviewAsset = () => {
+                    if (previewAsset.shouldRevoke && previewAsset.imageUrl && previewAsset.imageUrl.startsWith('blob:')) {
+                        URL.revokeObjectURL(previewAsset.imageUrl);
+                    }
+                    previewAsset.cardId = '';
+                    previewAsset.loading = false;
+                    previewAsset.ready = false;
+                    previewAsset.error = '';
+                    previewAsset.imageUrl = '';
+                    previewAsset.source = 'original';
+                    previewAsset.shouldRevoke = false;
+                };
+
+                const setPreviewAssetUrl = (url, shouldRevoke = false, source = 'original') => {
+                    if (previewAsset.shouldRevoke && previewAsset.imageUrl && previewAsset.imageUrl !== url && previewAsset.imageUrl.startsWith('blob:')) {
+                        URL.revokeObjectURL(previewAsset.imageUrl);
+                    }
+                    previewAsset.imageUrl = url;
+                    previewAsset.shouldRevoke = shouldRevoke;
+                    previewAsset.source = source;
+                };
+
+                const loadImageElement = (src) => new Promise((resolve, reject) => {
+                    const image = new Image();
+                    image.crossOrigin = 'anonymous';
+                    image.onload = () => resolve(image);
+                    image.onerror = () => reject(new Error('图片加载失败'));
+                    image.src = src;
+                });
+
+                const fetchImageObjectUrl = async (url) => {
+                    const resp = await fetch(url, { cache: 'no-store' });
+                    if (!resp.ok) {
+                        throw new Error('原图请求失败');
+                    }
+                    const blob = await resp.blob();
+                    return URL.createObjectURL(blob);
+                };
+
+                const preparePreviewAsset = async (card) => {
+                    clearPreviewAsset();
+                    previewAsset.cardId = card.id;
+                    previewAsset.loading = true;
+                    const candidates = [
+                        { url: card.avatar_url, source: 'original' },
+                        { url: card.thumbnail_url, source: 'thumbnail' },
+                        { url: defaultAvatar, source: 'fallback' }
+                    ].filter((item, index, list) => item.url && list.findIndex(entry => entry.url === item.url) === index);
+
+                    let lastError = '';
+                    for (const candidate of candidates) {
+                        let objectUrl = '';
+                        try {
+                            const finalUrl = candidate.url.startsWith('data:')
+                                ? candidate.url
+                                : (objectUrl = await fetchImageObjectUrl(candidate.url));
+                            await loadImageElement(finalUrl);
+                            if (previewAsset.cardId !== card.id) {
+                                if (objectUrl) URL.revokeObjectURL(objectUrl);
+                                return;
+                            }
+                            setPreviewAssetUrl(finalUrl, Boolean(objectUrl), candidate.source);
+                            previewAsset.ready = true;
+                            previewAsset.error = candidate.source === 'original' ? '' : '原图未能完整加载，已自动切换到可用图片。';
+                            previewAsset.loading = false;
+                            return;
+                        } catch (error) {
+                            if (objectUrl) URL.revokeObjectURL(objectUrl);
+                            lastError = error.message;
+                        }
+                    }
+
+                    setPreviewAssetUrl(defaultAvatar, false, 'fallback');
+                    previewAsset.ready = true;
+                    previewAsset.loading = false;
+                    previewAsset.error = lastError || '图片加载失败，已使用默认占位图。';
+                };
+
+                const startPreviewOpening = (card) => {
+                    previewOpening.active = true;
+                    previewOpening.name = card?.name || '角色卡';
+                    previewOpening.imageUrl = card?.thumbnail_url || card?.avatar_url || card?.avatar || defaultAvatar;
+                };
+
+                const stopPreviewOpening = () => {
+                    previewOpening.active = false;
+                    previewOpening.name = '';
+                    previewOpening.imageUrl = '';
+                };
+
                 // --- Parsing Logic from Reference (Robust Version) ---
                 const readPngChunks = (buffer) => {
                     const view = new DataView(buffer);
@@ -1614,7 +1837,7 @@
 
                     try {
                         while (offset < view.byteLength) {
-                            // 安全检查：防止读取超出边界
+                            // Guard against reading past the PNG buffer boundary.
                             if (offset + 8 > view.byteLength) break;
 
                             const length = view.getUint32(offset);
@@ -1625,7 +1848,7 @@
                                 view.getUint8(offset + 7)
                             );
                             
-                            // 安全检查：防止数据长度超出边界
+                            // Guard against invalid chunk lengths that exceed the remaining buffer.
                             if (offset + 8 + length > view.byteLength) break;
 
                             if (type === 'tEXt') {
@@ -1897,7 +2120,7 @@
                             
                         if (!resp.ok) throw new Error(data.error || '删除失败');
 
-                        // 如果返回…?data 为空，说明没有执行删…?
+                        // Treat an empty payload as a failed delete operation.
                         if (!data || data.length === 0) {
                             throw new Error('删除失败');
                         }
@@ -1925,7 +2148,7 @@
                     
                     const charName = content.name || content.char_name || 'Character';
                     
-                    // 识别 HTML 文档…?(<!DOCTYPE html> ... </html>)
+                    // Detect full HTML documents so the document block can be isolated from regex processing.
                     const htmlDocPattern = /(<!doctype html>|<html\b[^>]*>)/i;
                     const trimmed = text.trim();
                     const htmlMatch = trimmed.match(htmlDocPattern);
@@ -1946,57 +2169,55 @@
                             preText = text.substring(0, startIndex);
                             postText = text.substring(endIndex);
                             hasProtectedHtml = true;
-                            // 宏替换依然应用于 HTML …?
+                            // Macro replacement still applies to the protected HTML block.
                             protectedHtml = protectedHtml.replace(/\{\{char\}\}/gi, charName);
                         }
                     }
 
-                    // 如果有受保护…?HTML，我们只…?preText …?postText 进行正则脚本替换
-                    // 如果没有，则对全文进行替…?
+                    // Apply regex scripts only to the non-HTML segments when a protected document block exists.
+                    // Otherwise, process the full text payload.
                     let result = hasProtectedHtml ? (preText + "___HTML_BLOCK_PLACEHOLDER___" + postText) : text;
 
-                    // 1. 基本宏替…?(对非 HTML 部分)
+                    // 1. Apply base macro substitution to the mutable text region.
                     result = result.replace(/\{\{char\}\}/gi, charName);
                     
-                    // 2. 正则脚本替换 (Regex Scripts)
-                    // 按照 index.html …?importCharacter 逻辑进行多路径查找和字段映射
+                    // 2. Apply regex scripts using the same field resolution order as importCharacter.
                     let scripts = [];
                     
-                    // 路径 1: V2/ST 标准 (content.extensions.regex_scripts)
+                    // Path 1: V2 / SillyTavern standard location.
                     if (content.extensions && content.extensions.regex_scripts) {
                         scripts = content.extensions.regex_scripts;
                     }
-                    // 路径 2: Raw 上的 extensions (raw.extensions.regex_scripts)
+                    // Path 2: extensions stored on the raw root object.
                     else if (raw.extensions && raw.extensions.regex_scripts) {
                         scripts = raw.extensions.regex_scripts;
                     }
-                    // 路径 3: V1/Legacy 直接字段
+                    // Path 3: legacy top-level regex script fields.
                     else if (content.regex_scripts || raw.regex_scripts) {
                         scripts = content.regex_scripts || raw.regex_scripts;
                     }
-                    // 路径 4: 嵌套 data (某些异常结构)
+                    // Path 4: nested data payloads from non-standard exports.
                     else if (content.data && content.data.extensions && content.data.extensions.regex_scripts) {
                         scripts = content.data.extensions.regex_scripts;
                     }
 
                     if (scripts) {
-                        // 兼容对象或数组格…?
+                        // Support both array-based and object-based script collections.
                         const scriptList = Array.isArray(scripts) ? scripts : Object.values(scripts);
                         console.log('[Regex] Found scripts count:', scriptList.length);
                         
                         scriptList.forEach(script => {
                             try {
-                                // 标准化字…?(参…?index.html)
+                                // Normalize enablement semantics before evaluating the script.
                                 // ST uses 'disabled', we might use 'enabled' in some contexts, but ST cards usually have 'disabled'
                                 // Default is enabled if disabled is undefined or false
                                 const isDisabled = script.disabled === true;
                                 if (isDisabled) return;
 
-                                // 模式检查：plaza.html 是显示模…?(isDisplay=true)
-                                // 如果脚本指定…?promptOnly (仅用…?Prompt)，则跳过
+                                // Skip prompt-only scripts because the plaza preview is display-only.
                                 if (script.promptOnly) return;
 
-                                // 字段映射
+                                // Resolve the pattern, flags, and replacement fields.
                                 let regexPattern = script.regex || script.findRegex;
                                 let flags = script.flags || script.regexFlags || 'g';
                                 const replacement = script.hasOwnProperty('replacement')
@@ -2005,18 +2226,18 @@
 
                                 if (!regexPattern) return;
 
-                                // 解析 /pattern/flags 字符串格…?
+                                // Parse inline /pattern/flags syntax when present.
                                 if (typeof regexPattern === 'string' && regexPattern.startsWith('/') && regexPattern.lastIndexOf('/') > 0) {
                                     const lastSlash = regexPattern.lastIndexOf('/');
                                     const potentialFlags = regexPattern.substring(lastSlash + 1);
-                                    // 简单的 flags 验证
+                                    // Accept only valid JavaScript regex flags.
                                     if (/^[gimsuy]*$/.test(potentialFlags)) {
                                         flags = potentialFlags;
                                         regexPattern = regexPattern.substring(1, lastSlash);
                                     }
                                 }
                                 
-                                // 处理 ST 常见的内联修饰符 (?s), (?i), (?m)
+                                // Convert common SillyTavern inline modifiers into JavaScript flags.
                                 if (regexPattern.includes('(?s)')) {
                                     regexPattern = regexPattern.replace(/\(\?s\)/g, '');
                                     if (!flags.includes('s')) flags += 's';
@@ -2033,8 +2254,7 @@
                                 const re = new RegExp(regexPattern, flags);
                                 const oldResult = result;
                                 
-                                // 简单保护逻辑：防止破坏HTML标签结构（如果替换内容包含HTML，或者是特定UI脚本，则不保护）
-                                // 这里为了兼容 plaza 的渲染，直接替换通常是可以的，因…?renderMarkdown 会再次清…?
+                                // Apply the replacement directly and rely on the markdown render pipeline to sanitize the output.
                                 result = result.replace(re, replacement);
                                 
                                 if (oldResult !== result) {
@@ -2048,7 +2268,7 @@
                         console.log('[Regex] No scripts found in card data');
                     }
                     
-                    // 还原受保护的 HTML …?
+                    // Restore the protected HTML document block after regex processing.
                     if (hasProtectedHtml) {
                         result = result.replace("___HTML_BLOCK_PLACEHOLDER___", protectedHtml);
                     }
@@ -2057,52 +2277,112 @@
                 };
 
                 const previewCard = async (card) => {
-                    const bgImage = document.getElementById('mobile-bg-img');
-                    if (bgImage) {
-                        bgImage.style.opacity = '0';
-                        bgImage.style.filter = 'none';
-                        bgImage.style.transform = 'scale(1) translateZ(0)';
-                        delete bgImage.dataset.fallback;
-                    }
-                    
-                    // 按需加载完整卡片数据
-                    if (!card.data) {
-                        try {
-                            const headers = {};
-                            if (isLoggedIn.value) Object.assign(headers, userAuthHeaders());
-                            else if (isAdmin.value) Object.assign(headers, adminAuthHeaders());
-                            const resp = await fetch(API_BASE + '/api/cards/' + card.id, { headers });
-                            if (resp.ok) {
-                                const fullCard = await resp.json();
-                                card.data = fullCard.data;
+                    const openingStartedAt = Date.now();
+                    startPreviewOpening(card);
+                    try {
+                        const bgImage = document.getElementById('mobile-bg-img');
+                        if (bgImage) {
+                            bgImage.style.opacity = '0';
+                            bgImage.style.filter = 'none';
+                            bgImage.style.transform = 'scale(1) translateZ(0)';
+                            delete bgImage.dataset.fallback;
+                        }
+                        
+                        // Fetch the full card payload lazily when the preview needs it.
+                        if (!card.data) {
+                            try {
+                                const headers = {};
+                                if (isLoggedIn.value) Object.assign(headers, userAuthHeaders());
+                                else if (isAdmin.value) Object.assign(headers, adminAuthHeaders());
+                                const resp = await fetch(API_BASE + '/api/cards/' + card.id, { headers });
+                                if (resp.ok) {
+                                    const fullCard = await resp.json();
+                                    card.data = fullCard.data;
+                                }
+                            } catch (e) {
+                                console.error('Load card data error:', e);
                             }
-                        } catch (e) {
-                            console.error('Load card data error:', e);
                         }
-                    }
-                    
-                    const raw = card.data || {};
-                    // 兼容处理：如果数据在 raw.data (V2) 中，则取 raw.data，否则取 raw (V1)
-                    const content = raw.data || raw;
-                    
-                    // 应用正则替换
-                    const processedFirstMes = applyRegexScripts(content.first_mes || '', content, raw);
+                        
+                        const raw = card.data || {};
+                        // Prefer the V2 data payload and fall back to the legacy root object.
+                        const content = raw.data || raw;
+                        
+                        // Apply preview-time regex transformations.
+                        const processedFirstMes = applyRegexScripts(content.first_mes || '', content, raw);
 
-                    // 创建一个带 _display 属性的新对象，不污染原始数据结构（因为下载需要原始结构）
-                    selectedCard.value = {
-                        ...card,
-                        renderId: Date.now(), // 添加时间戳作为唯一ID，强制UI重新渲染
-                        _display: {
-                            personality: content.personality || '',
-                            first_mes: processedFirstMes,
-                            description: card.description || content.description || content.char_persona || '',
-                            name: card.name || content.name || content.char_name || ''
+                        // Build a derived preview model without mutating the original export payload.
+                        selectedCard.value = {
+                            ...card,
+                            renderId: Date.now(), // Use a unique render key to force the preview subtree to refresh.
+                            _display: {
+                                personality: content.personality || '',
+                                first_mes: processedFirstMes,
+                                description: card.description || content.description || content.char_persona || '',
+                                name: card.name || content.name || content.char_name || ''
+                            }
+                        };
+
+                        preparePreviewAsset(selectedCard.value).catch((error) => {
+                            console.error('Prepare preview asset error:', error);
+                            previewAsset.loading = false;
+                            previewAsset.ready = true;
+                            previewAsset.error = '原图加载失败，已使用默认占位图。';
+                            setPreviewAssetUrl(defaultAvatar, false, 'fallback');
+                        });
+                        
+                        // Load comments
+                        fetchComments(card.id);
+                    } finally {
+                        const elapsed = Date.now() - openingStartedAt;
+                        if (elapsed < PREVIEW_OPENING_MIN_MS) {
+                            await new Promise(resolve => setTimeout(resolve, PREVIEW_OPENING_MIN_MS - elapsed));
                         }
-                    };
-                    
-                    // Load comments
-                    fetchComments(card.id);
+                        stopPreviewOpening();
+                    }
                 };
+
+                const selectedCardHasComplexUi = computed(() => {
+                    if (!selectedCard.value) return false;
+                    const candidateText = [
+                        selectedCard.value._display?.first_mes,
+                        selectedCard.value._display?.description,
+                        selectedCard.value.description
+                    ].filter(Boolean).join('\n');
+                    return /<!doctype|<html|<iframe|<script|<style|<div|<section|<table/i.test(candidateText);
+                });
+
+                const canDownloadSelectedCard = computed(() => {
+                    if (!selectedCard.value || previewOpening.active || previewAsset.loading || !previewAsset.ready || isDownloadingCard.value) {
+                        return false;
+                    }
+                    return true;
+                });
+
+                const mobileDetailVisibleTags = computed(() => {
+                    const tags = selectedCard.value?.tags || [];
+                    if (mobileDetailTagsExpanded.value) {
+                        return tags;
+                    }
+                    return tags.slice(0, mobileDetailCollapsedTagCount.value);
+                });
+
+                const mobileDetailHiddenTagCount = computed(() => {
+                    const total = selectedCard.value?.tags?.length || 0;
+                    return Math.max(0, total - mobileDetailVisibleTags.value.length);
+                });
+
+                const downloadButtonLabel = computed(() => {
+                    if (selectedCard.value) {
+                        const isOwner = isCardOwnedByCurrentUser(selectedCard.value);
+                        if (!isAdmin.value && !isOwner && !isLoggedIn.value) return '登录后下载';
+                        if (!isAdmin.value && !isOwner && downloadCredits.value <= 0) return '下载次数不足';
+                    }
+                    if (isDownloadingCard.value) return '正在生成下载文件...';
+                    if (previewAsset.loading) return '原图加载中...';
+                    if (previewAsset.source !== 'original') return '使用回退图片下载';
+                    return '下载角色卡';
+                });
 
                 const formatDate = (dateStr) => {
                     const date = new Date(dateStr);
@@ -2471,7 +2751,7 @@
                     // Smart detection for block HTML (without standard doc tags)
                     const startsWithBlockHtml = /^\s*<(div|table|section|article|aside|header|footer|style|script)/i.test(trimmed);
                     if (startsWithBlockHtml && !trimmed.includes('```')) {
-                        // 使用 iframe 渲染 HTML 片段，避…?DOMPurify 破坏 onclick 事件，同时隔离样…?
+                        // Render raw HTML fragments inside an iframe to preserve interactive handlers and isolate styles.
                         const container = document.createElement('div');
                         container.className = 'html-card-container';
                         container.style.marginBottom = '-1px';
@@ -2518,7 +2798,7 @@
 
                 const downloadCard = async (card) => {
                     // Require login to download
-                    const isOwner = myUploadedIds.value.includes(card.id);
+                    const isOwner = isCardOwnedByCurrentUser(card);
                     if (!isAdmin.value && !isOwner && !isLoggedIn.value) {
                         showUserAuthModal.value = true;
                         userAuthMode.value = 'login';
@@ -2539,95 +2819,111 @@
                         }
                     }
 
-                    // Increment download count (Optimistic update)
-                    if (card.downloads_count === undefined) card.downloads_count = 0;
-                    card.downloads_count++;
-
-                    // Update download count via API
-                    try {
-                        const headers = isLoggedIn.value ? userAuthHeaders() : (isAdmin.value ? adminAuthHeaders() : { 'Content-Type': 'application/json' });
-                        const resp = await fetch(API_BASE + '/api/cards/' + card.id + '/download', {
-                            method: 'POST',
-                            headers: headers
-                        });
-                        
-                        if (!resp.ok) {
-                            const errData = await resp.json().catch(() => ({}));
-                            card.downloads_count--;
-                            if (errData.error) showToast(errData.error, 'warning');
-                            return;
-                        }
-                        
-                        const data = await resp.json();
-                        if (data.new_credits !== undefined && currentUser.value) {
-                            currentUser.value = { ...currentUser.value, download_credits: data.new_credits };
-                        }
-                    } catch (err) {
-                        console.error('Error in download count update:', err);
-                        card.downloads_count--;
+                    if (!previewAsset.ready || previewAsset.loading) {
+                        showToast('原图仍在加载，请等待提示消失后再下载', 'warning', 4000);
                         return;
                     }
-                    
-                    // 按需加载完整卡片数据
-                    if (!card.data) {
-                        try {
+
+                    isDownloadingCard.value = true;
+                    try {
+                        if (!card.data) {
                             const headers = {};
                             if (isLoggedIn.value) Object.assign(headers, userAuthHeaders());
                             else if (isAdmin.value) Object.assign(headers, adminAuthHeaders());
-                            const resp = await fetch(API_BASE + '/api/cards/' + card.id, { headers });
-                            if (resp.ok) {
-                                const fullCard = await resp.json();
-                                card.data = fullCard.data;
+                            const detailResp = await fetch(API_BASE + '/api/cards/' + card.id, { headers });
+                            if (!detailResp.ok) {
+                                throw new Error('加载卡片数据失败');
                             }
-                        } catch (e) {
-                            console.error('Load card data error:', e);
-                            showToast('加载卡片数据失败', 'error');
-                            return;
+                            const fullCard = await detailResp.json();
+                            card.data = fullCard.data;
                         }
-                    }
 
-                    const img = new Image();
-                    img.crossOrigin = "Anonymous";
-                    img.src = card.avatar_url || card.avatar;
-                    img.onload = () => {
+                        const imageSrc = previewAsset.cardId === card.id && previewAsset.imageUrl
+                            ? previewAsset.imageUrl
+                            : (card.avatar_url || card.thumbnail_url || defaultAvatar);
+                        const img = await loadImageElement(imageSrc);
                         const canvas = document.createElement('canvas');
-                        canvas.width = img.width; canvas.height = img.height;
+                        canvas.width = img.naturalWidth || img.width;
+                        canvas.height = img.naturalHeight || img.height;
                         const ctx = canvas.getContext('2d');
-                        ctx.drawImage(img, 0, 0);
-                        canvas.toBlob(async (blob) => {
-                            const arrayBuffer = await blob.arrayBuffer();
-                            const uint8Array = new Uint8Array(arrayBuffer);
-                            const jsonStr = JSON.stringify(card.data);
-                            const base64Str = btoa(encodeURIComponent(jsonStr).replace(/%([0-9A-F]{2})/g, (m, p1) => String.fromCharCode('0x' + p1)));
-                            
-                            const encoder = new TextEncoder();
-                            const keyData = encoder.encode("chara");
-                            const textData = encoder.encode(base64Str);
-                            const chunkData = new Uint8Array(keyData.length + 1 + textData.length);
-                            chunkData.set(keyData, 0); chunkData[keyData.length] = 0; chunkData.set(textData, keyData.length + 1);
-                            
-                            const type = encoder.encode("tEXt");
-                            const crcCheckData = new Uint8Array(type.length + chunkData.length);
-                            crcCheckData.set(type, 0); crcCheckData.set(chunkData, type.length);
-                            const crcVal = crc32(crcCheckData);
-                            
-                            const fullChunk = new Uint8Array(4 + 4 + chunkData.length + 4);
-                            const view = new DataView(fullChunk.buffer);
-                            view.setUint32(0, chunkData.length, false);
-                            fullChunk.set(type, 4); fullChunk.set(chunkData, 8);
-                            view.setUint32(8 + chunkData.length, crcVal, false);
-                            
-                            const finalPng = new Uint8Array(uint8Array.length + fullChunk.length);
-                            finalPng.set(uint8Array.slice(0, 33), 0);
-                            finalPng.set(fullChunk, 33);
-                            finalPng.set(uint8Array.slice(33), 33 + fullChunk.length);
-                            
-                            const url = URL.createObjectURL(new Blob([finalPng], { type: 'image/png' }));
-                            const a = document.createElement('a');
-                            a.href = url; a.download = card.name + '.png';
-                            a.click();
-                        }, 'image/png');
-                    };
+                        if (!ctx) {
+                            throw new Error('下载画布初始化失败');
+                        }
+                        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+                        const blob = await new Promise((resolve, reject) => {
+                            canvas.toBlob((value) => {
+                                if (value) resolve(value);
+                                else reject(new Error('导出图片失败'));
+                            }, 'image/png');
+                        });
+
+                        const arrayBuffer = await blob.arrayBuffer();
+                        const uint8Array = new Uint8Array(arrayBuffer);
+                        const jsonStr = JSON.stringify(card.data);
+                        const base64Str = btoa(encodeURIComponent(jsonStr).replace(/%([0-9A-F]{2})/g, (m, p1) => String.fromCharCode('0x' + p1)));
+
+                        const encoder = new TextEncoder();
+                        const keyData = encoder.encode('chara');
+                        const textData = encoder.encode(base64Str);
+                        const chunkData = new Uint8Array(keyData.length + 1 + textData.length);
+                        chunkData.set(keyData, 0);
+                        chunkData[keyData.length] = 0;
+                        chunkData.set(textData, keyData.length + 1);
+
+                        const type = encoder.encode('tEXt');
+                        const crcCheckData = new Uint8Array(type.length + chunkData.length);
+                        crcCheckData.set(type, 0);
+                        crcCheckData.set(chunkData, type.length);
+                        const crcVal = crc32(crcCheckData);
+
+                        const fullChunk = new Uint8Array(4 + 4 + chunkData.length + 4);
+                        const view = new DataView(fullChunk.buffer);
+                        view.setUint32(0, chunkData.length, false);
+                        fullChunk.set(type, 4);
+                        fullChunk.set(chunkData, 8);
+                        view.setUint32(8 + chunkData.length, crcVal, false);
+
+                        const finalPng = new Uint8Array(uint8Array.length + fullChunk.length);
+                        finalPng.set(uint8Array.slice(0, 33), 0);
+                        finalPng.set(fullChunk, 33);
+                        finalPng.set(uint8Array.slice(33), 33 + fullChunk.length);
+
+                        const headers = isLoggedIn.value ? userAuthHeaders() : (isAdmin.value ? adminAuthHeaders() : { 'Content-Type': 'application/json' });
+                        const resp = await fetch(API_BASE + '/api/cards/' + card.id + '/download', {
+                            method: 'POST',
+                            headers
+                        });
+                        const data = await resp.json().catch(() => ({}));
+                        if (!resp.ok) {
+                            throw new Error(data.error || '下载次数更新失败');
+                        }
+
+                        const listCard = cards.value.find(item => item.id === card.id);
+                        if (listCard) {
+                            listCard.downloads_count = (listCard.downloads_count || 0) + 1;
+                        }
+                        card.downloads_count = (card.downloads_count || 0) + 1;
+                        if (selectedCard.value && selectedCard.value.id === card.id) {
+                            selectedCard.value.downloads_count = card.downloads_count;
+                        }
+                        if (data.new_credits !== undefined && currentUser.value) {
+                            currentUser.value = { ...currentUser.value, download_credits: data.new_credits };
+                        }
+
+                        const url = URL.createObjectURL(new Blob([finalPng], { type: 'image/png' }));
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = card.name + '.png';
+                        a.click();
+                        setTimeout(() => URL.revokeObjectURL(url), 1000);
+                        showToast('下载已开始', 'success');
+                    } catch (err) {
+                        console.error('Download error:', err);
+                        showToast(err.message || '下载失败', 'error', 4000);
+                    } finally {
+                        isDownloadingCard.value = false;
+                    }
                 };
 
                 // ============== Edit Card ==============
@@ -2705,7 +3001,7 @@
                             data: editingCard.value.full_data,
                             creator_notes: editingCard.value.creator_notes
                         };
-                        // 仅当头像是新上传的 data URL 时才发送，避免将 API 端点 URL 写回数据库
+                        // Persist avatar data only when the editor is holding a newly uploaded data URL.
                         if (editingCard.value.avatar_url && editingCard.value.avatar_url.startsWith('data:')) {
                             editPayload.avatar_url = editingCard.value.avatar_url;
                         }
@@ -2766,6 +3062,12 @@
 
                 // Reset to page 1 when filters change
                 watch([searchQuery, cardSort, currentTab], () => { currentPage.value = 1; });
+                watch(selectedCard, (card) => {
+                    mobileDetailTagsExpanded.value = false;
+                    if (!card) {
+                        clearPreviewAsset();
+                    }
+                });
 
                 // ============== Visit Tracking ==============
                 const totalVisits = ref(0);
@@ -2791,12 +3093,15 @@
                 };
 
                 onMounted(() => {
+                    loadPublicSettings();
                     fetchCards();
                     checkAdminToken();
                     checkUserToken();
                     trackVisit();
                     fetchVisits();
                     window.addEventListener('resize', handleWindowResize);
+                    window.addEventListener('focus', handleWindowFocus);
+                    document.addEventListener('visibilitychange', handleVisibilityChange);
                     document.addEventListener('click', () => { showSortDropdown.value = false; });
                     window.addEventListener('message', (event) => {
                         if (event.data && event.data.type === 'slash_command') {
@@ -2807,12 +3112,15 @@
 
                 onUnmounted(() => {
                     window.removeEventListener('resize', handleWindowResize);
+                    window.removeEventListener('focus', handleWindowFocus);
+                    document.removeEventListener('visibilitychange', handleVisibilityChange);
                 });
 
                 return {
                     cards, cardSort, showSortDropdown, loading, searchQuery, filteredCards, pagedCards, defaultAvatar,
                     showUploadModal, showSearchModal, uploadingCard, isUploading, handleFileSelect, confirmUpload, handleUploadClick,
                     selectedCard, previewCard, formatDate, downloadCard, deleteCard, moveCard,
+                    previewOpening, stopPreviewOpening,
                     toasts, currentTab, myUploadedIds, popularTags, visiblePopularTags, showPopularTagsToggle, modalPopularTags, searchTag,
                     handleMobileScroll,
                     isAdmin, handleLogoClick, handleAdminLogout, renderMarkdown, renderCardPreview,
@@ -2820,6 +3128,8 @@
                     comments, loadingComments, newComment, submitComment, deleteComment, likeComment, likeCard, replyToComment, cancelReply,
                     commentTree, expandedComments, toggleReplies,
                     downloadCredits,
+                    previewAsset, canDownloadSelectedCard, downloadButtonLabel, selectedCardHasComplexUi,
+                    mobileDetailTagsExpanded, mobileDetailVisibleTags, mobileDetailHiddenTagCount,
                     // User Auth
                     isLoggedIn, currentUser, showUserAuthModal, userAuthMode, userAuthForm, userAuthError,
                     handleUserAuth, handleUserLogout,

@@ -14,7 +14,7 @@ const db = new Database(DB_PATH);
 
 // Enable WAL mode for better concurrent read performance
 db.pragma('journal_mode = WAL');
-db.pragma('busy_timeout = 5000');
+db.pragma('busy_timeout = 30000');
 db.pragma('foreign_keys = ON');
 
 function initDatabase() {
@@ -141,7 +141,14 @@ function initDatabase() {
 
     // Seed admin user from environment variables
     const adminUsername = process.env.ADMIN_USERNAME || 'admin';
+    if (process.env.NODE_ENV === 'production' && (!process.env.ADMIN_PASSWORD || process.env.ADMIN_PASSWORD === '123456')) {
+        throw new Error('[FATAL] ADMIN_PASSWORD must be explicitly set in production and must not use the default value');
+    }
     const adminPassword = process.env.ADMIN_PASSWORD || '123456';
+
+    if (adminPassword === '123456') {
+        console.warn('[Security] Using the default admin password. Set ADMIN_PASSWORD before deploying to production.');
+    }
 
     const existing = db.prepare('SELECT id FROM admin_users WHERE username = ?').get(adminUsername);
     if (!existing) {
@@ -156,7 +163,11 @@ function initDatabase() {
         site_description: '发现和分享角色卡',
         allow_anonymous_upload: 'true',
         allow_anonymous_comment: 'true',
-        max_upload_size_mb: '50'
+        max_upload_size_mb: '50',
+        popular_tags: '',
+        tag_library: '',
+        hidden_popular_tags: '',
+        hidden_tag_library: ''
     };
     const upsertSetting = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
     for (const [key, value] of Object.entries(defaultSettings)) {

@@ -1,9 +1,10 @@
 const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
+const dns = require('dns').promises;
+const net = require('net');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-// const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const compression = require('compression');
 const cookieParser = require('cookie-parser');
@@ -16,8 +17,14 @@ try {
 const { db, initDatabase, cleanupLoginAttempts, cleanupOldLogs } = require('./database');
 
 const app = express();
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const PORT = parseInt(process.env.PORT) || 9191;
-const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+const HOST = process.env.HOST || '0.0.0.0';
+const JWT_SECRET = process.env.JWT_SECRET || (IS_PRODUCTION ? '' : crypto.randomBytes(32).toString('hex'));
+
+if (!JWT_SECRET) {
+    throw new Error('[FATAL] JWT_SECRET must be set in production');
+}
 
 // ============== Middleware ==============
 app.use(helmet({
@@ -42,6 +49,10 @@ app.use(express.static(path.join(__dirname, 'public'), {
         }
     }
 }));
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
 // ============== Auth Helpers ==============
 function generateAdminToken(user) {
@@ -343,6 +354,109 @@ function sanitizeAvatarUrl(avatarUrl, cardId) {
     return '';
 }
 
+function parseDataUrlAsset(dataUrl) {
+    const match = String(dataUrl).match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) {
+        throw new Error('无效的 data URL');
+    }
+    return {
+        buffer: Buffer.from(match[2], 'base64'),
+        contentType: match[1],
+        cacheControl: 'public, max-age=604800, immutable'
+    };
+}
+
+async function fetchRemoteAvatarAsset(url) {
+    const parsedUrl = new URL(url);
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        throw new Error('不支持的远程图片协议');
+    }
+
+    const host = parsedUrl.hostname.toLowerCase();
+    const isPrivateIpAddress = (ipAddress) => {
+        const ipVersion = net.isIP(ipAddress);
+        if (ipVersion === 4) {
+            if (ipAddress.startsWith('10.') || ipAddress.startsWith('127.') || ipAddress.startsWith('169.254.') || ipAddress.startsWith('192.168.')) {
+                return true;
+            }
+            if (ipAddress.startsWith('172.')) {
+                const secondOctet = Number(ipAddress.split('.')[1]);
+                return secondOctet >= 16 && secondOctet <= 31;
+            }
+            return false;
+        }
+        if (ipVersion === 6) {
+            const normalized = ipAddress.toLowerCase();
+            return normalized === '::1' || normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe80');
+        }
+        return false;
+    };
+
+    if (host === 'localhost' || host.endsWith('.local') || isPrivateIpAddress(host)) {
+        throw new Error('不允许访问内网图片地址');
+    }
+
+    const resolved = await dns.lookup(host, { all: true, verbatim: true }).catch(() => []);
+    if (resolved.some(entry => isPrivateIpAddress(entry.address))) {
+        throw new Error('不允许访问内网图片地址');
+    }
+
+    for (let attempt = 0; attempt <= MAX_REMOTE_FETCH_RETRIES; attempt++) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), REMOTE_FETCH_TIMEOUT_MS);
+        try {
+            const response = await fetch(url, {
+                redirect: 'follow',
+                signal: controller.signal,
+                headers: {
+                    'User-Agent': 'RP-Forum-ImageProxy/1.0'
+                }
+            });
+            if (!response.ok) {
+                if (response.status >= 500 && attempt < MAX_REMOTE_FETCH_RETRIES) {
+                    continue;
+                }
+                throw new Error(`远程图片请求失败: ${response.status}`);
+            }
+
+            const chunks = [];
+            let totalBytes = 0;
+            for await (const chunk of response.body) {
+                totalBytes += chunk.length;
+                if (totalBytes > MAX_REMOTE_IMAGE_BYTES) {
+                    throw new Error('远程图片体积过大');
+                }
+                chunks.push(chunk);
+            }
+
+            const contentType = response.headers.get('content-type') || 'application/octet-stream';
+            const cacheControl = response.headers.get('cache-control') || 'public, max-age=86400';
+            return {
+                buffer: Buffer.concat(chunks),
+                contentType,
+                cacheControl
+            };
+        } catch (error) {
+            const shouldRetry = attempt < MAX_REMOTE_FETCH_RETRIES && (error.name === 'AbortError' || /远程图片请求失败: 5\d\d/.test(error.message));
+            if (!shouldRetry) {
+                throw error;
+            }
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    throw new Error('远程图片请求失败');
+}
+
+async function resolveAvatarAsset(avatarUrl) {
+    if (!avatarUrl) return null;
+    if (avatarUrl.startsWith('data:')) {
+        return parseDataUrlAsset(avatarUrl);
+    }
+    return fetchRemoteAvatarAsset(avatarUrl);
+}
+
 function cacheThumbnail(cardId, body, contentType, cacheControl) {
     if (thumbnailCache.size >= THUMBNAIL_MAX_CACHE) {
         const firstKey = thumbnailCache.keys().next().value;
@@ -372,25 +486,40 @@ app.get('/api/cards/:id/avatar', async (req, res) => {
             return res.send(placeholder);
         }
 
-        const dataUrl = safeAvatarUrl;
-        const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
-        if (!match) {
-            // Not a data URL, redirect to the actual URL
-            return res.redirect(dataUrl);
-        }
-        const contentType = match[1];
-        const buffer = Buffer.from(match[2], 'base64');
-        res.set('Content-Type', contentType);
-        res.set('Cache-Control', 'public, max-age=604800, immutable');
-        res.send(buffer);
+        const asset = await resolveAvatarAsset(safeAvatarUrl);
+        res.set('Content-Type', asset.contentType);
+        res.set('Cache-Control', asset.cacheControl);
+        res.send(asset.buffer);
     } catch (err) {
-        res.status(500).end();
+        console.error('Avatar fetch error:', err);
+        try {
+            const row = db.prepare('SELECT name FROM character_cards WHERE id = ?').get(req.params.id);
+            if (!row) {
+                return res.status(404).end();
+            }
+            const svg = buildPlaceholderSvg(row.name, req.params.id, 800, 1067, 320);
+            if (!sharp) {
+                res.set('Content-Type', 'image/svg+xml');
+                res.set('Cache-Control', 'public, max-age=86400');
+                return res.send(svg);
+            }
+            const placeholder = await sharp(Buffer.from(svg)).png().toBuffer();
+            res.set('Content-Type', 'image/png');
+            res.set('Cache-Control', 'public, max-age=86400');
+            return res.send(placeholder);
+        } catch (fallbackError) {
+            console.error('Avatar placeholder fallback error:', fallbackError);
+            res.status(500).end();
+        }
     }
 });
 
 // Thumbnail endpoint - compressed preview for card listing
 const thumbnailCache = new Map();
 const THUMBNAIL_MAX_CACHE = 500;
+const REMOTE_FETCH_TIMEOUT_MS = 5000;
+const MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_REMOTE_FETCH_RETRIES = 2;
 
 app.get('/api/cards/:id/thumbnail', async (req, res) => {
     try {
@@ -423,21 +552,15 @@ app.get('/api/cards/:id/thumbnail', async (req, res) => {
             return res.send(placeholder);
         }
 
-        const dataUrl = safeAvatarUrl;
-        const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
-        if (!match) {
-            return res.redirect(dataUrl);
-        }
+        const asset = await resolveAvatarAsset(safeAvatarUrl);
 
         if (!sharp) {
-            const originalBuffer = Buffer.from(match[2], 'base64');
-            res.set('Content-Type', match[1]);
-            res.set('Cache-Control', 'public, max-age=604800, immutable');
-            return res.send(originalBuffer);
+            res.set('Content-Type', asset.contentType);
+            res.set('Cache-Control', asset.cacheControl);
+            return res.send(asset.buffer);
         }
 
-        const buffer = Buffer.from(match[2], 'base64');
-        const thumbnail = await sharp(buffer)
+        const thumbnail = await sharp(asset.buffer)
             .resize(400, null, { withoutEnlargement: true })
             .webp({ quality: 75 })
             .toBuffer();
@@ -449,18 +572,27 @@ app.get('/api/cards/:id/thumbnail', async (req, res) => {
         res.send(thumbnail);
     } catch (err) {
         console.error('Thumbnail generation error:', err);
-        // Fallback to full avatar
+        // Fallback to full avatar bytes
         try {
-            const row = db.prepare('SELECT avatar_url FROM character_cards WHERE id = ?').get(req.params.id);
+            const row = db.prepare('SELECT avatar_url, name FROM character_cards WHERE id = ?').get(req.params.id);
             const safeAvatarUrl = row ? sanitizeAvatarUrl(row.avatar_url, req.params.id) : '';
             if (safeAvatarUrl) {
-                const m = safeAvatarUrl.match(/^data:([^;]+);base64,(.+)$/);
-                if (m) {
-                    res.set('Content-Type', m[1]);
-                    res.set('Cache-Control', 'public, max-age=604800');
-                    return res.send(Buffer.from(m[2], 'base64'));
+                const asset = await resolveAvatarAsset(safeAvatarUrl);
+                res.set('Content-Type', asset.contentType);
+                res.set('Cache-Control', asset.cacheControl);
+                return res.send(asset.buffer);
+            }
+            if (row) {
+                const svg = buildPlaceholderSvg(row.name, req.params.id, 400, 533, 160);
+                if (!sharp) {
+                    res.set('Content-Type', 'image/svg+xml');
+                    res.set('Cache-Control', 'public, max-age=86400');
+                    return res.send(svg);
                 }
-                return res.redirect(safeAvatarUrl);
+                const placeholder = await sharp(Buffer.from(svg)).webp({ quality: 75 }).toBuffer();
+                res.set('Content-Type', 'image/webp');
+                res.set('Cache-Control', 'public, max-age=86400');
+                return res.send(placeholder);
             }
         } catch {}
         res.status(500).end();
@@ -616,7 +748,17 @@ app.put('/api/cards/:id', (req, res) => {
         if (name !== undefined)          { fields.push('name = ?');          values.push(name); }
         if (description !== undefined)   { fields.push('description = ?');   values.push(description); }
         if (avatar_url !== undefined && avatar_url.startsWith('data:')) { fields.push('avatar_url = ?'); values.push(avatar_url); }
-        if (data !== undefined)          { fields.push('data = ?');          values.push(typeof data === 'string' ? data : JSON.stringify(data)); }
+        if (data !== undefined) {
+            let serializedData;
+            try {
+                serializedData = typeof data === 'string' ? data : JSON.stringify(data);
+                JSON.parse(serializedData);
+            } catch (parseError) {
+                return res.status(400).json({ error: '卡片数据格式无效' });
+            }
+            fields.push('data = ?');
+            values.push(serializedData);
+        }
         if (creator_notes !== undefined) { fields.push('creator_notes = ?'); values.push(creator_notes); }
         if (created_at !== undefined && decoded.role === 'admin') {
             if (isNaN(Date.parse(created_at))) return res.status(400).json({ error: '无效的时间格式' });
@@ -648,26 +790,32 @@ app.post('/api/cards/:id/download', requireUserOrAdmin, (req, res) => {
         const card = db.prepare('SELECT id, uploader_user_id FROM character_cards WHERE id = ?').get(id);
         if (!card) return res.status(404).json({ error: '卡片不存在' });
 
-        // Admin has no credit cost
-        if (!req.admin) {
-            const isOwner = req.user && card.uploader_user_id === req.user.id;
-            if (!isOwner) {
-                const result = db.prepare('UPDATE users SET download_credits = download_credits - 1 WHERE id = ? AND download_credits > 0').run(req.user.id);
-                if (result.changes === 0) {
-                    return res.status(403).json({ error: '下载次数不足' });
+        let newCredits = null;
+        const recordDownload = db.transaction(() => {
+            if (!req.admin) {
+                const isOwner = req.user && card.uploader_user_id === req.user.id;
+                if (!isOwner) {
+                    const result = db.prepare('UPDATE users SET download_credits = download_credits - 1 WHERE id = ? AND download_credits > 0').run(req.user.id);
+                    if (result.changes === 0) {
+                        const error = new Error('下载次数不足');
+                        error.statusCode = 403;
+                        throw error;
+                    }
                 }
+                newCredits = db.prepare('SELECT download_credits FROM users WHERE id = ?').get(req.user.id)?.download_credits ?? null;
             }
-        }
 
-        db.prepare('UPDATE character_cards SET downloads_count = downloads_count + 1 WHERE id = ?').run(id);
+            db.prepare('UPDATE character_cards SET downloads_count = downloads_count + 1 WHERE id = ?').run(id);
+        });
+
+        recordDownload();
         logOperation({ userType: req.user ? 'user' : 'admin', userId: req.user?.id || req.admin?.id, username: req.user?.username || req.admin?.username, action: 'download', targetType: 'card', targetId: id, ip: req.ip });
-        
-        const newCredits = req.user 
-            ? db.prepare('SELECT download_credits FROM users WHERE id = ?').get(req.user.id)?.download_credits 
-            : null;
-        
+
         res.json({ success: true, new_credits: newCredits });
     } catch (err) {
+        if (err.statusCode) {
+            return res.status(err.statusCode).json({ error: err.message });
+        }
         console.error('Download count error:', err);
         res.status(500).json({ error: '更新下载次数失败' });
     }
@@ -1023,20 +1171,106 @@ app.get('/api/admin/settings', authenticateAdmin, (req, res) => {
     }
 });
 
+const PUBLIC_SETTINGS_KEYS = new Set([
+    'site_name',
+    'site_description',
+    'allow_anonymous_upload',
+    'allow_anonymous_comment',
+    'popular_tags',
+    'tag_library',
+    'hidden_popular_tags',
+    'hidden_tag_library'
+]);
+
+app.get('/api/settings', (req, res) => {
+    try {
+        const settings = db.prepare('SELECT key, value FROM settings').all();
+        const result = {};
+        settings.forEach((setting) => {
+            if (PUBLIC_SETTINGS_KEYS.has(setting.key)) {
+                result[setting.key] = setting.value;
+            }
+        });
+        res.json(result);
+    } catch (err) {
+        console.error('Public settings error:', err);
+        res.status(500).json({ error: '获取站点设置失败' });
+    }
+});
+
 const ALLOWED_SETTINGS_KEYS = new Set([
     'site_name', 'site_description', 'allow_anonymous_upload',
-    'allow_anonymous_comment', 'max_upload_size_mb'
+    'allow_anonymous_comment', 'max_upload_size_mb',
+    'popular_tags', 'tag_library',
+    'hidden_popular_tags', 'hidden_tag_library'
 ]);
+
+const TAG_SETTING_KEYS = new Set([
+    'popular_tags',
+    'tag_library',
+    'hidden_popular_tags',
+    'hidden_tag_library'
+]);
+
+const MAX_TAG_SETTING_LENGTH = 5000;
+const MAX_TAG_COUNT = 300;
+const MAX_TAG_LENGTH = 40;
+
+function parseTagSettingValue(value) {
+    return String(value || '')
+        .split(/[\n,，]/)
+        .map(item => item.trim())
+        .filter(Boolean)
+        .filter((item, index, array) => array.indexOf(item) === index);
+}
+
+function validateTagSettingValue(key, value) {
+    const raw = String(value || '');
+    if (raw.length > MAX_TAG_SETTING_LENGTH) {
+        return `${key} 内容过长`;
+    }
+    const tags = parseTagSettingValue(raw);
+    if (tags.length > MAX_TAG_COUNT) {
+        return `${key} 标签数量过多`;
+    }
+    if (tags.some(tag => tag.length > MAX_TAG_LENGTH)) {
+        return `${key} 中存在过长标签`;
+    }
+    return '';
+}
 
 app.put('/api/admin/settings', authenticateAdmin, (req, res) => {
     try {
         const updates = req.body;
+        for (const [key, value] of Object.entries(updates)) {
+            if (!ALLOWED_SETTINGS_KEYS.has(key)) continue;
+            if (!TAG_SETTING_KEYS.has(key)) continue;
+            const error = validateTagSettingValue(key, value);
+            if (error) {
+                return res.status(400).json({ error });
+            }
+        }
         const stmt = db.prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)');
         const now = new Date().toISOString();
         for (const [key, value] of Object.entries(updates)) {
             if (!ALLOWED_SETTINGS_KEYS.has(key)) continue;
             stmt.run(key, String(value), now);
         }
+        logOperation({
+            userType: 'admin',
+            userId: req.admin.id,
+            username: req.admin.username,
+            action: 'admin_update_tag_settings',
+            targetType: 'settings',
+            targetId: 'tag-management',
+            ip: req.ip,
+            details: {
+                popular_tags_count: parseTagSettingValue(updates.popular_tags).length,
+                tag_library_count: parseTagSettingValue(updates.tag_library).length,
+                hidden_popular_tags_count: parseTagSettingValue(updates.hidden_popular_tags).length,
+                hidden_tag_library_count: parseTagSettingValue(updates.hidden_tag_library).length
+            }
+        });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: '更新设置失败' });
@@ -1102,13 +1336,91 @@ app.get('/api/admin/users', authenticateAdmin, (req, res) => {
         }
         const total = db.prepare(`SELECT COUNT(*) as count FROM users${where}`).get(...params).count;
         const users = db.prepare(
-            `SELECT id, username, password_hash, download_credits, created_at, last_login FROM users${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+            `SELECT id, username, download_credits, created_at, last_login FROM users${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`
         ).all(...params, limit, offset);
 
         res.json({ users, total, page, limit, totalPages: Math.ceil(total / limit) });
     } catch (err) {
         console.error('Admin users error:', err);
         res.status(500).json({ error: '获取用户列表失败' });
+    }
+});
+
+app.put('/api/admin/users/:id/credits', authenticateAdmin, (req, res) => {
+    try {
+        const userId = Number(req.params.id);
+        const credits = Number(req.body.download_credits);
+        if (!Number.isInteger(userId) || userId <= 0) {
+            return res.status(400).json({ error: '无效的用户 ID' });
+        }
+        if (!Number.isInteger(credits) || credits < 0) {
+            return res.status(400).json({ error: '下载次数必须是大于等于 0 的整数' });
+        }
+
+        const result = db.prepare('UPDATE users SET download_credits = ? WHERE id = ?').run(credits, userId);
+        if (result.changes === 0) {
+            return res.status(404).json({ error: '用户不存在' });
+        }
+
+        const user = db.prepare('SELECT id, username, download_credits, created_at, last_login FROM users WHERE id = ?').get(userId);
+        logOperation({
+            userType: 'admin',
+            userId: req.admin.id,
+            username: req.admin.username,
+            action: 'admin_update_user_credits',
+            targetType: 'user',
+            targetId: String(userId),
+            ip: req.ip,
+            details: { download_credits: credits, username: user?.username }
+        });
+
+        res.json({ success: true, user });
+    } catch (err) {
+        console.error('Admin update credits error:', err);
+        res.status(500).json({ error: '更新下载次数失败' });
+    }
+});
+
+app.post('/api/admin/users/:id/reset-password', authenticateAdmin, async (req, res) => {
+    try {
+        const userId = Number(req.params.id);
+        if (!Number.isInteger(userId) || userId <= 0) {
+            return res.status(400).json({ error: '无效的用户 ID' });
+        }
+
+        const user = db.prepare('SELECT id, username FROM users WHERE id = ?').get(userId);
+        if (!user) {
+            return res.status(404).json({ error: '用户不存在' });
+        }
+
+        const providedPassword = typeof req.body.newPassword === 'string' ? req.body.newPassword.trim() : '';
+        const temporaryPassword = providedPassword || crypto.randomBytes(6).toString('base64url');
+        if (temporaryPassword.length < 6) {
+            return res.status(400).json({ error: '新密码长度至少 6 位' });
+        }
+
+        const hash = await bcrypt.hash(temporaryPassword, 12);
+        db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, userId);
+        logOperation({
+            userType: 'admin',
+            userId: req.admin.id,
+            username: req.admin.username,
+            action: 'admin_reset_user_password',
+            targetType: 'user',
+            targetId: String(userId),
+            ip: req.ip,
+            details: { username: user.username }
+        });
+
+        res.json({
+            success: true,
+            username: user.username,
+            temporary_password: temporaryPassword,
+            message: '原密码无法从哈希中恢复，已重置为新的临时密码。'
+        });
+    } catch (err) {
+        console.error('Admin reset password error:', err);
+        res.status(500).json({ error: '重置密码失败' });
     }
 });
 
@@ -1151,9 +1463,9 @@ initDatabase();
 setInterval(cleanupLoginAttempts, 60 * 60 * 1000);
 setInterval(cleanupOldLogs, 24 * 60 * 60 * 1000);
 
-const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Server] RP Forum running at http://0.0.0.0:${PORT}`);
-    console.log(`[Server] Admin panel at http://0.0.0.0:${PORT}/admin`);
+const server = app.listen(PORT, HOST, () => {
+    console.log(`[Server] RP Forum running at http://${HOST}:${PORT}`);
+    console.log(`[Server] Admin panel at http://${HOST}:${PORT}/admin`);
 });
 
 // Graceful shutdown for Docker
