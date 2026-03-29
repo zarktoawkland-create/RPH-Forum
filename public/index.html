@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
@@ -7,7 +7,7 @@
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
-    <title>角色卡广场</title>
+    <title>万相广场</title>
     <script src="/tailwind.js"></script>
     <script src="/vue.global.js"></script>
     <!-- Local API backend replaces Supabase -->
@@ -51,7 +51,9 @@
                         'slide-up': 'slideUp 0.3s ease-out',
                         'slide-down': 'slideDown 0.3s ease-out',
                         'scale-in': 'scaleIn 0.2s ease-out',
+                        'detail-scale-in': 'detailScaleIn 0.48s cubic-bezier(0.22, 1, 0.36, 1)',
                         'slide-up-mobile': 'slideUpMobile 0.5s cubic-bezier(0.32, 0.72, 0, 1)',
+                        'detail-slide-up-mobile': 'detailSlideUpMobile 0.72s cubic-bezier(0.22, 1, 0.36, 1)',
                         'zoom-in': 'zoomIn 0.3s ease-out',
                     },
                     keyframes: {
@@ -71,7 +73,15 @@
                             '0%': { transform: 'scale(0.95)', opacity: '0' },
                             '100%': { transform: 'scale(1)', opacity: '1' },
                         },
+                        detailScaleIn: {
+                            '0%': { transform: 'scale(0.94) translateY(18px)', opacity: '0' },
+                            '100%': { transform: 'scale(1) translateY(0)', opacity: '1' },
+                        },
                         slideUpMobile: {
+                            '0%': { transform: 'translateY(100%)' },
+                            '100%': { transform: 'translateY(0)' },
+                        },
+                        detailSlideUpMobile: {
                             '0%': { transform: 'translateY(100%)' },
                             '100%': { transform: 'translateY(0)' },
                         },
@@ -760,33 +770,23 @@
             </div>
         </div>
 
-        <div v-if="previewOpening.active && !selectedCard" class="fixed inset-0 z-[100] flex flex-col items-center justify-center bg-gray-900/95 backdrop-blur-xl animate-fade-in">
+        <div v-if="previewOpening.active || (selectedCard && previewAsset.loading)" class="fixed inset-0 z-[100] flex flex-col items-center justify-center bg-gray-900/80 backdrop-blur-xl animate-fade-in">
             <div class="relative mb-8">
                 <div class="w-20 h-20 border-[3px] border-white/10 rounded-full"></div>
                 <div class="w-20 h-20 border-[3px] border-primary-500 border-t-transparent rounded-full animate-spin absolute top-0 left-0"></div>
             </div>
             <p class="text-xl font-bold text-white mb-3 tracking-wide">正在准备详情界面</p>
-            <p class="text-sm text-gray-400 max-w-[280px] text-center leading-relaxed">正在请求数据，请稍候...</p>
+            <p class="text-sm text-gray-400 max-w-[280px] text-center leading-relaxed">{{ previewAsset.loading ? '资源正在加载，请稍等...' : '正在请求数据，请稍候...' }}</p>
+            <button v-if="selectedCard || previewOpening.active" @click="selectedCard = null; stopPreviewOpening()" class="mt-10 px-8 py-3 text-white/50 hover:text-white bg-white/5 hover:bg-white/10 rounded-full transition-all text-sm font-medium border border-white/5 hover:border-white/20 active:scale-95">
+                取消进入
+            </button>
         </div>
 
         <!-- Preview Modal (Full Screen Mobile Scroll & Parallax) -->
         <div v-if="selectedCard" class="fixed inset-0 z-50 flex md:items-center justify-center bg-black/60 animate-fade-in md:p-4 md:backdrop-blur-sm md:transition-all md:duration-300">
-            
-            <!-- Global Detail Loading Overlay -->
-            <div v-if="previewAsset.loading" class="fixed inset-0 z-[100] flex flex-col items-center justify-center bg-gray-900/95 backdrop-blur-xl animate-fade-in">
-                <div class="relative mb-8">
-                    <div class="w-20 h-20 border-[3px] border-white/10 rounded-full"></div>
-                    <div class="w-20 h-20 border-[3px] border-primary-500 border-t-transparent rounded-full animate-spin absolute top-0 left-0"></div>
-                </div>
-                <p class="text-xl font-bold text-white mb-3 tracking-wide">正在准备详情界面</p>
-                <p class="text-sm text-gray-400 max-w-[280px] text-center leading-relaxed">资源正在加载，请稍等...</p>
-                <button @click="selectedCard = null; stopPreviewOpening()" class="mt-10 px-8 py-3 text-white/50 hover:text-white bg-white/5 hover:bg-white/10 rounded-full transition-all text-sm font-medium border border-white/5 hover:border-white/20 active:scale-95">
-                    取消进入
-                </button>
-            </div>
 
             <!-- Mobile Container (Parallax Scroll) -->
-            <div v-if="!previewAsset.loading" class="md:hidden w-full h-full relative overflow-y-auto scroll-smooth-mobile no-scrollbar animate-slide-up-mobile"
+            <div v-if="!previewAsset.loading" class="md:hidden w-full h-full relative overflow-y-auto scroll-smooth-mobile no-scrollbar animate-detail-slide-up-mobile"
                  @scroll="handleMobileScroll">
                 
                 <!-- Close Button -->
@@ -977,7 +977,7 @@
             </div>
 
             <!-- Desktop Container (Unchanged) -->
-            <div v-if="!previewAsset.loading" class="hidden md:flex bg-white w-full h-auto max-h-[90vh] max-w-6xl rounded-[2.5rem] flex-row shadow-2xl overflow-hidden animate-scale-in relative">
+            <div v-if="!previewAsset.loading" class="hidden md:flex bg-white w-full h-auto max-h-[90vh] max-w-6xl rounded-[2.5rem] flex-row shadow-2xl overflow-hidden animate-detail-scale-in relative">
                 
                 <!-- Left: Image Section -->
                 <div class="relative w-2/5 h-auto flex-shrink-0 bg-gray-100">
@@ -1257,8 +1257,9 @@
                 const isDownloadingCard = ref(false);
                 const toasts = ref([]);
                 const windowWidth = ref(window.innerWidth);
+                let previewOpenRequestId = 0;
                 let mobileScrollTicking = false;
-                const PREVIEW_OPENING_MIN_MS = 1300;
+                const PREVIEW_OPENING_MIN_MS = 500;
 
                 const handleMobileScroll = (e) => {
                     if (mobileScrollTicking) return;
@@ -1784,12 +1785,17 @@
                 };
 
                 const startPreviewOpening = (card) => {
+                    const requestId = ++previewOpenRequestId;
                     previewOpening.active = true;
                     previewOpening.name = card?.name || '角色卡';
                     previewOpening.imageUrl = card?.thumbnail_url || card?.avatar_url || card?.avatar || defaultAvatar;
+                    return requestId;
                 };
 
-                const stopPreviewOpening = () => {
+                const stopPreviewOpening = ({ cancelPending = true } = {}) => {
+                    if (cancelPending) {
+                        previewOpenRequestId += 1;
+                    }
                     previewOpening.active = false;
                     previewOpening.name = '';
                     previewOpening.imageUrl = '';
@@ -2244,7 +2250,8 @@
 
                 const previewCard = async (card) => {
                     const openingStartedAt = Date.now();
-                    startPreviewOpening(card);
+                    const requestId = startPreviewOpening(card);
+                    let preparedPreviewCard = null;
                     try {
                         const bgImage = document.getElementById('mobile-bg-img');
                         if (bgImage) {
@@ -2278,7 +2285,7 @@
                         const processedFirstMes = applyRegexScripts(content.first_mes || '', content, raw);
 
                         // Build a derived preview model without mutating the original export payload.
-                        selectedCard.value = {
+                        preparedPreviewCard = {
                             ...card,
                             renderId: Date.now(), // Use a unique render key to force the preview subtree to refresh.
                             _display: {
@@ -2289,7 +2296,7 @@
                             }
                         };
 
-                        preparePreviewAsset(selectedCard.value).catch((error) => {
+                        await preparePreviewAsset(preparedPreviewCard).catch((error) => {
                             console.error('Prepare preview asset error:', error);
                             previewAsset.loading = false;
                             previewAsset.ready = true;
@@ -2304,7 +2311,10 @@
                         if (elapsed < PREVIEW_OPENING_MIN_MS) {
                             await new Promise(resolve => setTimeout(resolve, PREVIEW_OPENING_MIN_MS - elapsed));
                         }
-                        stopPreviewOpening();
+                        if (requestId === previewOpenRequestId && preparedPreviewCard) {
+                            selectedCard.value = preparedPreviewCard;
+                            stopPreviewOpening({ cancelPending: false });
+                        }
                     }
                 };
 
