@@ -34,7 +34,7 @@
 |------|--------|------|
 | `ADMIN_USERNAME` | `admin` | 管理员用户名 |
 | `ADMIN_PASSWORD` | 平台生成强密码 | 管理员初始密码，生产环境必须显式设置 |
-| `JWT_SECRET` | 平台生成强密钥 | JWT 签名密钥，生产环境必须保持稳定 |
+| `JWT_SECRET` | 平台生成强密钥 | JWT 签名密钥，建议显式设置；未设置时会回退为基于 ADMIN_PASSWORD 派生的稳定密钥 |
 | `PORT` | `9191` | 服务端口 |
 | `DATA_DIR` | `/app/data` | 数据存储目录 |
 
