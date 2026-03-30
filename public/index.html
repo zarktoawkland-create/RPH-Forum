@@ -2751,19 +2751,6 @@
                     return plainText.length > 140 ? plainText.slice(0, 140) + '…' : plainText;
                 };
 
-                // --- Export Logic from Reference ---
-                const crc32Table = new Uint32Array(256);
-                for (let i = 0; i < 256; i++) {
-                    let c = i;
-                    for (let k = 0; k < 8; k++) { c = ((c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1)); }
-                    crc32Table[i] = c;
-                }
-                const crc32 = (buf) => {
-                    let crc = 0xFFFFFFFF;
-                    for (let i = 0; i < buf.length; i++) { crc = (crc >>> 8) ^ crc32Table[(crc ^ buf[i]) & 0xFF]; }
-                    return (crc ^ 0xFFFFFFFF) >>> 0;
-                };
-
                 const downloadCard = async (card) => {
                     // Require login to download
                     const isOwner = isCardOwnedByCurrentUser(card);
@@ -2787,76 +2774,8 @@
                         }
                     }
 
-                    if (!previewAsset.ready || previewAsset.loading) {
-                        showToast('原图仍在加载，请等待提示消失后再下载', 'warning', 4000);
-                        return;
-                    }
-
                     isDownloadingCard.value = true;
                     try {
-                        if (!card.data) {
-                            const headers = {};
-                            if (isLoggedIn.value) Object.assign(headers, userAuthHeaders());
-                            else if (isAdmin.value) Object.assign(headers, adminAuthHeaders());
-                            const detailResp = await fetch(API_BASE + '/api/cards/' + card.id, { headers });
-                            if (!detailResp.ok) {
-                                throw new Error('加载卡片数据失败');
-                            }
-                            const fullCard = await detailResp.json();
-                            card.data = fullCard.data;
-                        }
-
-                        const imageSrc = previewAsset.cardId === card.id && previewAsset.imageUrl
-                            ? previewAsset.imageUrl
-                            : (card.avatar_url || card.thumbnail_url || defaultAvatar);
-                        const img = await loadImageElement(imageSrc);
-                        const canvas = document.createElement('canvas');
-                        canvas.width = img.naturalWidth || img.width;
-                        canvas.height = img.naturalHeight || img.height;
-                        const ctx = canvas.getContext('2d');
-                        if (!ctx) {
-                            throw new Error('下载画布初始化失败');
-                        }
-                        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
-                        const blob = await new Promise((resolve, reject) => {
-                            canvas.toBlob((value) => {
-                                if (value) resolve(value);
-                                else reject(new Error('导出图片失败'));
-                            }, 'image/png');
-                        });
-
-                        const arrayBuffer = await blob.arrayBuffer();
-                        const uint8Array = new Uint8Array(arrayBuffer);
-                        const jsonStr = JSON.stringify(card.data);
-                        const base64Str = btoa(encodeURIComponent(jsonStr).replace(/%([0-9A-F]{2})/g, (m, p1) => String.fromCharCode('0x' + p1)));
-
-                        const encoder = new TextEncoder();
-                        const keyData = encoder.encode('chara');
-                        const textData = encoder.encode(base64Str);
-                        const chunkData = new Uint8Array(keyData.length + 1 + textData.length);
-                        chunkData.set(keyData, 0);
-                        chunkData[keyData.length] = 0;
-                        chunkData.set(textData, keyData.length + 1);
-
-                        const type = encoder.encode('tEXt');
-                        const crcCheckData = new Uint8Array(type.length + chunkData.length);
-                        crcCheckData.set(type, 0);
-                        crcCheckData.set(chunkData, type.length);
-                        const crcVal = crc32(crcCheckData);
-
-                        const fullChunk = new Uint8Array(4 + 4 + chunkData.length + 4);
-                        const view = new DataView(fullChunk.buffer);
-                        view.setUint32(0, chunkData.length, false);
-                        fullChunk.set(type, 4);
-                        fullChunk.set(chunkData, 8);
-                        view.setUint32(8 + chunkData.length, crcVal, false);
-
-                        const finalPng = new Uint8Array(uint8Array.length + fullChunk.length);
-                        finalPng.set(uint8Array.slice(0, 33), 0);
-                        finalPng.set(fullChunk, 33);
-                        finalPng.set(uint8Array.slice(33), 33 + fullChunk.length);
-
                         const headers = isLoggedIn.value ? userAuthHeaders() : (isAdmin.value ? adminAuthHeaders() : { 'Content-Type': 'application/json' });
                         const resp = await fetch(API_BASE + '/api/cards/' + card.id + '/download', {
                             method: 'POST',
@@ -2879,12 +2798,17 @@
                             currentUser.value = { ...currentUser.value, download_credits: data.new_credits };
                         }
 
-                        const url = URL.createObjectURL(new Blob([finalPng], { type: 'image/png' }));
+                        if (!data.download_url) {
+                            throw new Error('下载链接生成失败');
+                        }
+
                         const a = document.createElement('a');
-                        a.href = url;
-                        a.download = card.name + '.png';
+                        a.href = data.download_url;
+                        a.rel = 'noopener';
+                        a.style.display = 'none';
+                        document.body.appendChild(a);
                         a.click();
-                        setTimeout(() => URL.revokeObjectURL(url), 1000);
+                        a.remove();
                         showToast('下载已开始', 'success');
                     } catch (err) {
                         console.error('Download error:', err);
