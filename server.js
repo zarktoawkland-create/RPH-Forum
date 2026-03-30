@@ -1,1633 +1,3038 @@
-const express = require('express');
-const path = require('path');
-const crypto = require('crypto');
-const dns = require('dns').promises;
-const net = require('net');
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
-const helmet = require('helmet');
-const compression = require('compression');
-const cookieParser = require('cookie-parser');
-let sharp = null;
-try {
-    sharp = require('sharp');
-} catch (err) {
-    console.warn('[Server] sharp unavailable, image compression disabled:', err.message);
-}
-const { db, initDatabase, cleanupLoginAttempts, cleanupOldLogs } = require('./database');
-
-const app = express();
-const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-const PORT = parseInt(process.env.PORT) || 9191;
-const HOST = process.env.HOST || '0.0.0.0';
-const EXPLICIT_JWT_SECRET = (process.env.JWT_SECRET || '').trim();
-const DERIVED_JWT_SECRET = process.env.ADMIN_PASSWORD
-    ? crypto.createHash('sha256').update(`rp-forum:${process.env.ADMIN_PASSWORD}`).digest('hex')
-    : '';
-const JWT_SECRET = EXPLICIT_JWT_SECRET || DERIVED_JWT_SECRET || (IS_PRODUCTION ? '' : crypto.randomBytes(32).toString('hex'));
-
-if (!JWT_SECRET) {
-    throw new Error('[FATAL] JWT_SECRET must be set in production');
-}
-
-if (IS_PRODUCTION && !EXPLICIT_JWT_SECRET) {
-    console.warn('[Security] JWT_SECRET is not set. Falling back to a derived secret from ADMIN_PASSWORD. Set JWT_SECRET explicitly for independent secret rotation.');
-}
-
-// ============== Middleware ==============
-app.use(helmet({
-    contentSecurityPolicy: false, // Allow CDN scripts in frontend
-    crossOriginEmbedderPolicy: false,
-    frameguard: false // Allow embedding in iframe from other sites
-}));
-app.use(compression());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-app.use(cookieParser());
-
-
-// Serve static files (no cache for HTML, allow cache for assets)
-app.use(express.static(path.join(__dirname, 'public'), {
-    etag: false,
-    setHeaders: (res, filePath) => {
-        if (filePath.endsWith('.html')) {
-            res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-        } else {
-            res.set('Cache-Control', 'public, max-age=86400');
-        }
-    }
-}));
-
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// ============== Auth Helpers ==============
-function generateAdminToken(user) {
-    return jwt.sign(
-        { id: user.id, username: user.username, role: 'admin' },
-        JWT_SECRET,
-        { expiresIn: '24h' }
-    );
-}
-
-function generateUserToken(user) {
-    return jwt.sign(
-        { id: user.id, username: user.username, role: 'user' },
-        JWT_SECRET,
-        { expiresIn: '7d' }
-    );
-}
-
-function authenticateAdmin(req, res, next) {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: '未授权' });
-    }
-    try {
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
-        if (decoded.role !== 'admin') return res.status(403).json({ error: '权限不足' });
-        req.admin = decoded;
-        next();
-    } catch (err) {
-        return res.status(401).json({ error: '令牌无效或已过期' });
-    }
-}
-
-function authenticateUser(req, res, next) {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: '请先登录' });
-    }
-    try {
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
-        if (decoded.role !== 'user') return res.status(403).json({ error: '权限不足' });
-        req.user = decoded;
-        next();
-    } catch (err) {
-        return res.status(401).json({ error: '令牌无效或已过期' });
-    }
-}
-
-function optionalUserAuth(req, res, next) {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        req.user = null;
-        return next();
-    }
-    try {
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
-        if (decoded.role === 'user') req.user = decoded;
-        else if (decoded.role === 'admin') { req.admin = decoded; req.user = null; }
-        else req.user = null;
-        next();
-    } catch (err) {
-        req.user = null;
-        next();
-    }
-}
-
-function requireUserOrAdmin(req, res, next) {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: '请先登录后再操作' });
-    }
-    try {
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
-        if (decoded.role === 'user') {
-            req.user = decoded;
-        } else if (decoded.role === 'admin') {
-            req.admin = decoded;
-        } else {
-            return res.status(403).json({ error: '权限不足' });
-        }
-        next();
-    } catch (err) {
-        return res.status(401).json({ error: '令牌无效或已过期' });
-    }
-}
-
-// ============== Operation Logging ==============
-function logOperation({ userType, userId, username, action, targetType, targetId, ip, details }) {
-    try {
-        db.prepare(
-            `INSERT INTO operation_logs (user_type, user_id, username, action, target_type, target_id, ip_address, details, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(userType || 'anonymous', userId || null, username || null, action,
-              targetType || null, targetId || null, ip || null,
-              details ? JSON.stringify(details) : null, new Date().toISOString());
-    } catch (err) {
-        console.error('Log operation error:', err);
-    }
-}
-
-// ============== Brute Force Protection ==============
-function checkBruteForce(ip, username) {
-    const cutoff = new Date(Date.now() - LOGIN_WINDOW_MINUTES * 60 * 1000).toISOString();
-    const attempts = db.prepare(
-        `SELECT COUNT(*) as count FROM login_attempts 
-         WHERE ip_address = ? AND attempt_time > ? AND success = 0`
-    ).get(ip, cutoff);
-
-    if (attempts.count >= MAX_LOGIN_ATTEMPTS) {
-        return { blocked: true, reason: `IP 登录尝试过多，请 ${LOCKOUT_MINUTES} 分钟后再试` };
-    }
-
-    if (username) {
-        const userAttempts = db.prepare(
-            `SELECT COUNT(*) as count FROM login_attempts 
-             WHERE username = ? AND attempt_time > ? AND success = 0`
-        ).get(username, cutoff);
-        if (userAttempts.count >= MAX_LOGIN_ATTEMPTS) {
-            return { blocked: true, reason: `该账户登录尝试过多，请 ${LOCKOUT_MINUTES} 分钟后再试` };
-        }
-    }
-
-    return { blocked: false };
-}
-
-function recordLoginAttempt(ip, username, success) {
-    db.prepare(
-        'INSERT INTO login_attempts (ip_address, username, attempt_time, success) VALUES (?, ?, ?, ?)'
-    ).run(ip, username, new Date().toISOString(), success ? 1 : 0);
-}
-
-// ============== Auth Routes ==============
-app.post('/api/auth/login', async (req, res) => {
-    const { username, password } = req.body;
-    if (!username || !password) {
-        return res.status(400).json({ error: '请输入用户名和密码' });
-    }
-
-    const ip = req.ip;
-
-    const user = db.prepare('SELECT * FROM admin_users WHERE username = ?').get(username);
-    if (!user) {
-        return res.status(401).json({ error: '用户名或密码错误' });
-    }
-
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) {
-        return res.status(401).json({ error: '用户名或密码错误' });
-    }
-
-    // Success
-    db.prepare('UPDATE admin_users SET last_login = ? WHERE id = ?').run(new Date().toISOString(), user.id);
-    logOperation({ userType: 'admin', userId: user.id, username: user.username, action: 'admin_login', targetType: 'user', targetId: String(user.id), ip, details: { role: 'admin' } });
-
-    const token = generateAdminToken(user);
-    res.json({ token, user: { id: user.id, username: user.username } });
-});
-
-app.get('/api/auth/me', authenticateAdmin, (req, res) => {
-    res.json({ user: req.admin });
-});
-
-// ============== User Registration & Login ==============
-app.post('/api/user/register', async (req, res) => {
-    try {
-        const { username, password } = req.body;
-        if (!username || !password) {
-            return res.status(400).json({ error: '请输入用户名和密码' });
-        }
-        if (username.length < 2 || username.length > 20) {
-            return res.status(400).json({ error: '用户名长度需为2-20个字符' });
-        }
-        if (password.length < 6) {
-            return res.status(400).json({ error: '密码长度至少6个字符' });
-        }
-
-        const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
-        if (existing) {
-            return res.status(409).json({ error: '用户名已存在' });
-        }
-
-        const hash = await bcrypt.hash(password, 12);
-        const result = db.prepare(
-            'INSERT INTO users (username, password_hash, download_credits) VALUES (?, ?, 1)'
-        ).run(username, hash);
-
-        const user = db.prepare('SELECT id, username, download_credits, created_at FROM users WHERE id = ?').get(result.lastInsertRowid);
-        logOperation({ userType: 'user', userId: user.id, username: user.username, action: 'register', targetType: 'user', targetId: String(user.id), ip: req.ip });
-        const token = generateUserToken(user);
-        res.json({ token, user });
-    } catch (err) {
-        console.error('Register error:', err);
-        res.status(500).json({ error: '注册失败' });
-    }
-});
-
-app.post('/api/user/login', async (req, res) => {
-    const { username, password } = req.body;
-    if (!username || !password) {
-        return res.status(400).json({ error: '请输入用户名和密码' });
-    }
-
-    const ip = req.ip;
-
-    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-    if (!user) {
-        return res.status(401).json({ error: '用户名或密码错误' });
-    }
-
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) {
-        return res.status(401).json({ error: '用户名或密码错误' });
-    }
-
-    db.prepare('UPDATE users SET last_login = ? WHERE id = ?').run(new Date().toISOString(), user.id);
-    logOperation({ userType: 'user', userId: user.id, username: user.username, action: 'login', targetType: 'user', targetId: String(user.id), ip });
-
-    const token = generateUserToken(user);
-    res.json({ 
-        token, 
-        user: { id: user.id, username: user.username, download_credits: user.download_credits } 
-    });
-});
-
-app.get('/api/user/me', authenticateUser, (req, res) => {
-    const user = db.prepare('SELECT id, username, download_credits, created_at FROM users WHERE id = ?').get(req.user.id);
-    if (!user) return res.status(404).json({ error: '用户不存在' });
-    res.json({ user });
-});
-
-// ============== Card Routes (Public) ==============
-function generateId() {
-    return crypto.randomUUID();
-}
-
-function stableStringify(obj) {
-    if (obj === null || obj === undefined) return String(obj);
-    if (typeof obj !== 'object') return JSON.stringify(obj);
-    if (Array.isArray(obj)) return '[' + obj.map(stableStringify).join(',') + ']';
-    const keys = Object.keys(obj).sort();
-    return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';
-}
-
-function hashCardData(data) {
-    if (!data) return null;
-    return crypto.createHash('sha256').update(stableStringify(data)).digest('hex');
-}
-
-app.get('/api/cards', optionalUserAuth, (req, res) => {
-    try {
-        const orderByClause = req.query.sort === 'hot'
-            ? '((IFNULL(cc.downloads_count, 0) * 0.7) + (IFNULL(cc.likes_count, 0) * 0.3)) DESC, cc.downloads_count DESC, cc.likes_count DESC, cc.created_at DESC'
-            : 'cc.created_at DESC';
-        const userId = req.user?.id ?? req.admin?.id ?? null;
-        const cards = db.prepare(
-            `SELECT cc.id, cc.name, cc.description, cc.creator_notes,
-                    cc.downloads_count, cc.uploader_user_id, cc.created_at, cc.likes_count,
-                    CASE WHEN cl.id IS NOT NULL THEN 1 ELSE 0 END AS user_liked,
-                    (SELECT COUNT(*) FROM character_comments cmt WHERE cmt.card_id = cc.id) AS comment_count
-             FROM character_cards cc
-             LEFT JOIN card_likes cl ON cl.card_id = cc.id AND cl.user_id = ?
-             ORDER BY ${orderByClause}`
-        ).all(userId);
-        res.json(cards);
-    } catch (err) {
-        console.error('Fetch cards error:', err);
-        res.status(500).json({ error: '获取卡片失败' });
-    }
-});
-
-function buildPlaceholderSvg(name, seed, width, height, fontSize) {
-    const firstChar = Array.from(((name || '?').trim() || '?'))[0] || '?';
-    const colors = ['#6366f1', '#8b5cf6', '#ec4899', '#f43f5e', '#f97316', '#14b8a6', '#3b82f6', '#10b981'];
-    const key = String(seed || name || '?');
-    const colorIndex = Array.from(key).reduce((sum, char) => sum + char.charCodeAt(0), 0) % colors.length;
-    const color = colors[colorIndex];
-    return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
-        <rect width="${width}" height="${height}" fill="${color}"/>
-        <text x="${width / 2}" y="${height / 2 + fontSize * 0.08}" font-size="${fontSize}" fill="white" text-anchor="middle" dominant-baseline="middle" font-family="sans-serif">${firstChar}</text>
-    </svg>`;
-}
-
-function isCorruptedAvatarUrl(avatarUrl, cardId) {
-    if (!avatarUrl) return false;
-    const normalized = String(avatarUrl).trim();
-    if (!normalized) return false;
-    if (normalized.startsWith('blob:') || normalized.startsWith('file:')) return true;
-    return new RegExp(`/api/cards/${cardId}/(?:avatar|thumbnail)$`, 'i').test(normalized);
-}
-
-function sanitizeAvatarUrl(avatarUrl, cardId) {
-    if (!avatarUrl) return '';
-    const normalized = String(avatarUrl).trim();
-    if (!normalized || isCorruptedAvatarUrl(normalized, cardId)) return '';
-    if (normalized.startsWith('data:')) return normalized;
-    if (/^https?:\/\//i.test(normalized)) return normalized;
-    return '';
-}
-
-function parseDataUrlAsset(dataUrl) {
-    const match = String(dataUrl).match(/^data:([^;]+);base64,(.+)$/);
-    if (!match) {
-        throw new Error('无效的 data URL');
-    }
-    return {
-        buffer: Buffer.from(match[2], 'base64'),
-        contentType: match[1],
-        cacheControl: 'public, max-age=604800, immutable'
-    };
-}
-
-async function fetchRemoteAvatarAsset(url) {
-    const parsedUrl = new URL(url);
-    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
-        throw new Error('不支持的远程图片协议');
-    }
-
-    const host = parsedUrl.hostname.toLowerCase();
-    const isPrivateIpAddress = (ipAddress) => {
-        const ipVersion = net.isIP(ipAddress);
-        if (ipVersion === 4) {
-            if (ipAddress.startsWith('10.') || ipAddress.startsWith('127.') || ipAddress.startsWith('169.254.') || ipAddress.startsWith('192.168.')) {
-                return true;
-            }
-            if (ipAddress.startsWith('172.')) {
-                const secondOctet = Number(ipAddress.split('.')[1]);
-                return secondOctet >= 16 && secondOctet <= 31;
-            }
-            return false;
-        }
-        if (ipVersion === 6) {
-            const normalized = ipAddress.toLowerCase();
-            return normalized === '::1' || normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe80');
-        }
-        return false;
-    };
-
-    if (host === 'localhost' || host.endsWith('.local') || isPrivateIpAddress(host)) {
-        throw new Error('不允许访问内网图片地址');
-    }
-
-    const resolved = await dns.lookup(host, { all: true, verbatim: true }).catch(() => []);
-    if (resolved.some(entry => isPrivateIpAddress(entry.address))) {
-        throw new Error('不允许访问内网图片地址');
-    }
-
-    for (let attempt = 0; attempt <= MAX_REMOTE_FETCH_RETRIES; attempt++) {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), REMOTE_FETCH_TIMEOUT_MS);
-        try {
-            const response = await fetch(url, {
-                redirect: 'follow',
-                signal: controller.signal,
-                headers: {
-                    'User-Agent': 'RP-Forum-ImageProxy/1.0'
-                }
-            });
-            if (!response.ok) {
-                if (response.status >= 500 && attempt < MAX_REMOTE_FETCH_RETRIES) {
-                    continue;
-                }
-                throw new Error(`远程图片请求失败: ${response.status}`);
-            }
-
-            const chunks = [];
-            let totalBytes = 0;
-            for await (const chunk of response.body) {
-                totalBytes += chunk.length;
-                if (totalBytes > MAX_REMOTE_IMAGE_BYTES) {
-                    throw new Error('远程图片体积过大');
-                }
-                chunks.push(chunk);
-            }
-
-            const contentType = response.headers.get('content-type') || 'application/octet-stream';
-            const cacheControl = response.headers.get('cache-control') || 'public, max-age=86400';
-            return {
-                buffer: Buffer.concat(chunks),
-                contentType,
-                cacheControl
-            };
-        } catch (error) {
-            const shouldRetry = attempt < MAX_REMOTE_FETCH_RETRIES && (error.name === 'AbortError' || /远程图片请求失败: 5\d\d/.test(error.message));
-            if (!shouldRetry) {
-                throw error;
-            }
-        } finally {
-            clearTimeout(timeout);
-        }
-    }
-
-    throw new Error('远程图片请求失败');
-}
-
-async function resolveAvatarAsset(avatarUrl) {
-    if (!avatarUrl) return null;
-    if (avatarUrl.startsWith('data:')) {
-        return parseDataUrlAsset(avatarUrl);
-    }
-    return fetchRemoteAvatarAsset(avatarUrl);
-}
-
-const DOWNLOAD_LINK_TTL_SECONDS = 60;
-const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-const PNG_IHDR_END_OFFSET = 33;
-const crc32Table = new Uint32Array(256);
-for (let i = 0; i < 256; i++) {
-    let current = i;
-    for (let bit = 0; bit < 8; bit++) {
-        current = (current & 1) ? (0xEDB88320 ^ (current >>> 1)) : (current >>> 1);
-    }
-    crc32Table[i] = current >>> 0;
-}
-
-function crc32(buffer) {
-    let crc = 0xFFFFFFFF;
-    for (const value of buffer) {
-        crc = (crc >>> 8) ^ crc32Table[(crc ^ value) & 0xFF];
-    }
-    return (crc ^ 0xFFFFFFFF) >>> 0;
-}
-
-function sanitizeDownloadFilename(name) {
-    const baseName = String(name || 'character-card')
-        .trim()
-        .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
-        .replace(/\s+/g, ' ')
-        .slice(0, 120) || 'character-card';
-    return `${baseName}.png`;
-}
-
-function createAttachmentDisposition(filename) {
-    const asciiFallback = filename
-        .replace(/[^\x20-\x7E]/g, '_')
-        .replace(/["]/g, '_') || 'character-card.png';
-    return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
-}
-
-function createCardDownloadToken(cardId, fileName) {
-    return jwt.sign(
-        { role: 'card-download', cardId, fileName },
-        JWT_SECRET,
-        { expiresIn: `${DOWNLOAD_LINK_TTL_SECONDS}s` }
-    );
-}
-
-function buildCardMetadataChunk(cardData) {
-    const payload = Buffer.from(JSON.stringify(cardData ?? null), 'utf8').toString('base64');
-    const chunkData = Buffer.concat([
-        Buffer.from('chara\0', 'latin1'),
-        Buffer.from(payload, 'utf8')
-    ]);
-    const chunkType = Buffer.from('tEXt', 'ascii');
-    const chunkLength = Buffer.alloc(4);
-    chunkLength.writeUInt32BE(chunkData.length, 0);
-    const chunkCrc = Buffer.alloc(4);
-    chunkCrc.writeUInt32BE(crc32(Buffer.concat([chunkType, chunkData])), 0);
-    return Buffer.concat([chunkLength, chunkType, chunkData, chunkCrc]);
-}
-
-function injectCardMetadataIntoPng(pngBuffer, cardData) {
-    const source = Buffer.isBuffer(pngBuffer) ? pngBuffer : Buffer.from(pngBuffer);
-    if (source.length < PNG_IHDR_END_OFFSET || !source.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
-        throw new Error('下载图片不是有效的 PNG 文件');
-    }
-
-    const metadataChunk = buildCardMetadataChunk(cardData);
-    return Buffer.concat([
-        source.subarray(0, PNG_IHDR_END_OFFSET),
-        metadataChunk,
-        source.subarray(PNG_IHDR_END_OFFSET)
-    ]);
-}
-
-async function buildCardDownloadFile(card) {
-    const safeAvatarUrl = sanitizeAvatarUrl(card.avatar_url, card.id);
-    let pngBuffer = null;
-
-    if (!safeAvatarUrl) {
-        if (!sharp) {
-            throw new Error('sharp 不可用，无法生成下载卡图片');
-        }
-        const placeholder = buildPlaceholderSvg(card.name, card.id, 800, 1067, 320);
-        pngBuffer = await sharp(Buffer.from(placeholder)).png().toBuffer();
-    } else {
-        const asset = await resolveAvatarAsset(safeAvatarUrl);
-        const contentType = String(asset.contentType || '').toLowerCase();
-        if (sharp) {
-            pngBuffer = await sharp(asset.buffer).png().toBuffer();
-        } else if (contentType.includes('png')) {
-            pngBuffer = Buffer.from(asset.buffer);
-        } else {
-            throw new Error('sharp 不可用，无法转换下载卡图片');
-        }
-    }
-
-    return injectCardMetadataIntoPng(pngBuffer, card.data);
-}
-
-function cacheThumbnail(cardId, body, contentType, cacheControl) {
-    if (thumbnailCache.size >= THUMBNAIL_MAX_CACHE) {
-        const firstKey = thumbnailCache.keys().next().value;
-        thumbnailCache.delete(firstKey);
-    }
-    thumbnailCache.set(cardId, { body, contentType, cacheControl });
-}
-
-app.get('/api/cards/:id/avatar', async (req, res) => {
-    try {
-        const row = db.prepare('SELECT avatar_url, name FROM character_cards WHERE id = ?').get(req.params.id);
-        if (!row) return res.status(404).end();
-
-        const safeAvatarUrl = sanitizeAvatarUrl(row.avatar_url, req.params.id);
-
-        // No avatar data — generate placeholder
-        if (!safeAvatarUrl) {
-            const svg = buildPlaceholderSvg(row.name, req.params.id, 800, 1067, 320);
-            if (!sharp) {
-                res.set('Content-Type', 'image/svg+xml');
-                res.set('Cache-Control', 'public, max-age=86400');
-                return res.send(svg);
-            }
-            const placeholder = await sharp(Buffer.from(svg)).png().toBuffer();
-            res.set('Content-Type', 'image/png');
-            res.set('Cache-Control', 'public, max-age=86400');
-            return res.send(placeholder);
-        }
-
-        const asset = await resolveAvatarAsset(safeAvatarUrl);
-        res.set('Content-Type', asset.contentType);
-        res.set('Cache-Control', asset.cacheControl);
-        res.send(asset.buffer);
-    } catch (err) {
-        console.error('Avatar fetch error:', err);
-        try {
-            const row = db.prepare('SELECT name FROM character_cards WHERE id = ?').get(req.params.id);
-            if (!row) {
-                return res.status(404).end();
-            }
-            const svg = buildPlaceholderSvg(row.name, req.params.id, 800, 1067, 320);
-            if (!sharp) {
-                res.set('Content-Type', 'image/svg+xml');
-                res.set('Cache-Control', 'public, max-age=86400');
-                return res.send(svg);
-            }
-            const placeholder = await sharp(Buffer.from(svg)).png().toBuffer();
-            res.set('Content-Type', 'image/png');
-            res.set('Cache-Control', 'public, max-age=86400');
-            return res.send(placeholder);
-        } catch (fallbackError) {
-            console.error('Avatar placeholder fallback error:', fallbackError);
-            res.status(500).end();
-        }
-    }
-});
-
-// Thumbnail endpoint - compressed preview for card listing
-const thumbnailCache = new Map();
-const THUMBNAIL_MAX_CACHE = 500;
-const REMOTE_FETCH_TIMEOUT_MS = 5000;
-const MAX_REMOTE_IMAGE_BYTES = 20 * 1024 * 1024;
-const MAX_REMOTE_FETCH_RETRIES = 2;
-
-app.get('/api/cards/:id/thumbnail', async (req, res) => {
-    try {
-        const cardId = req.params.id;
-        
-        // Check memory cache
-        if (thumbnailCache.has(cardId)) {
-            const cached = thumbnailCache.get(cardId);
-            res.set('Content-Type', cached.contentType);
-            res.set('Cache-Control', cached.cacheControl);
-            return res.send(cached.body);
-        }
-
-        const row = db.prepare('SELECT avatar_url, name FROM character_cards WHERE id = ?').get(cardId);
-        if (!row) return res.status(404).end();
-        const safeAvatarUrl = sanitizeAvatarUrl(row.avatar_url, cardId);
-
-        // No avatar data — generate placeholder thumbnail with first character
-        if (!safeAvatarUrl) {
-            const svg = buildPlaceholderSvg(row.name, cardId, 400, 533, 160);
-            if (!sharp) {
-                res.set('Content-Type', 'image/svg+xml');
-                res.set('Cache-Control', 'public, max-age=86400');
-                return res.send(svg);
-            }
-            const placeholder = await sharp(Buffer.from(svg)).webp({ quality: 75 }).toBuffer();
-            cacheThumbnail(cardId, placeholder, 'image/webp', 'public, max-age=86400');
-            res.set('Content-Type', 'image/webp');
-            res.set('Cache-Control', 'public, max-age=86400');
-            return res.send(placeholder);
-        }
-
-        const asset = await resolveAvatarAsset(safeAvatarUrl);
-
-        if (!sharp) {
-            res.set('Content-Type', asset.contentType);
-            res.set('Cache-Control', asset.cacheControl);
-            return res.send(asset.buffer);
-        }
-
-        const thumbnail = await sharp(asset.buffer)
-            .resize(400, null, { withoutEnlargement: true })
-            .webp({ quality: 75 })
-            .toBuffer();
-
-        cacheThumbnail(cardId, thumbnail, 'image/webp', 'public, max-age=2592000, immutable');
-
-        res.set('Content-Type', 'image/webp');
-        res.set('Cache-Control', 'public, max-age=2592000, immutable');
-        res.send(thumbnail);
-    } catch (err) {
-        console.error('Thumbnail generation error:', err);
-        // Fallback to full avatar bytes
-        try {
-            const row = db.prepare('SELECT avatar_url, name FROM character_cards WHERE id = ?').get(req.params.id);
-            const safeAvatarUrl = row ? sanitizeAvatarUrl(row.avatar_url, req.params.id) : '';
-            if (safeAvatarUrl) {
-                const asset = await resolveAvatarAsset(safeAvatarUrl);
-                res.set('Content-Type', asset.contentType);
-                res.set('Cache-Control', asset.cacheControl);
-                return res.send(asset.buffer);
-            }
-            if (row) {
-                const svg = buildPlaceholderSvg(row.name, req.params.id, 400, 533, 160);
-                if (!sharp) {
-                    res.set('Content-Type', 'image/svg+xml');
-                    res.set('Cache-Control', 'public, max-age=86400');
-                    return res.send(svg);
-                }
-                const placeholder = await sharp(Buffer.from(svg)).webp({ quality: 75 }).toBuffer();
-                res.set('Content-Type', 'image/webp');
-                res.set('Cache-Control', 'public, max-age=86400');
-                return res.send(placeholder);
-            }
-        } catch {}
-        res.status(500).end();
-    }
-});
-
-app.get('/api/cards/:id', optionalUserAuth, (req, res) => {
-    try {
-        const userId = req.user?.id ?? req.admin?.id ?? null;
-        const card = db.prepare(
-            `SELECT cc.*, CASE WHEN cl.id IS NOT NULL THEN 1 ELSE 0 END AS user_liked
-             FROM character_cards cc
-             LEFT JOIN card_likes cl ON cl.card_id = cc.id AND cl.user_id = ?
-             WHERE cc.id = ?`
-        ).get(userId, req.params.id);
-        if (!card) return res.status(404).json({ error: '卡片不存在' });
-        try { card.data = card.data ? JSON.parse(card.data) : null; } catch (e) { card.data = null; }
-        res.json(card);
-    } catch (err) {
-        console.error('Fetch card detail error:', err);
-        res.status(500).json({ error: '获取卡片详情失败' });
-    }
-});
-
-app.post('/api/cards', requireUserOrAdmin, (req, res) => {
-    try {
-        const { name, description, avatar_url, data, creator_notes } = req.body;
-        if (!name) {
-            return res.status(400).json({ error: '卡片名称不能为空' });
-        }
-
-        // Duplicate detection via stable hash of card data (atomic via UNIQUE index)
-        const dataHash = hashCardData(data);
-        if (dataHash) {
-            const existing = db.prepare('SELECT id, name FROM character_cards WHERE data_hash = ?').get(dataHash);
-            if (existing) {
-                return res.status(409).json({ error: `已存在完全相同的角色卡「${existing.name}」，禁止重复上传` });
-            }
-        }
-
-        const id = generateId();
-        const now = new Date().toISOString();
-        const dataStr = data ? JSON.stringify(data) : null;
-        const uploaderUserId = req.user ? req.user.id : null;
-        const safeAvatarUrl = sanitizeAvatarUrl(avatar_url, id);
-
-        try {
-            db.prepare(
-                'INSERT INTO character_cards (id, name, description, avatar_url, data, creator_notes, uploader_user_id, data_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-            ).run(id, name, description || '', safeAvatarUrl, dataStr, creator_notes || '', uploaderUserId, dataHash, now);
-        } catch (insertErr) {
-            if (insertErr.message && insertErr.message.includes('UNIQUE constraint failed')) {
-                const conflict = db.prepare('SELECT name FROM character_cards WHERE data_hash = ?').get(dataHash);
-                return res.status(409).json({ error: `已存在完全相同的角色卡「${conflict?.name || '未知'}」，禁止重复上传` });
-            }
-            throw insertErr;
-        }
-
-        const card = db.prepare('SELECT * FROM character_cards WHERE id = ?').get(id);
-        try { card.data = card.data ? JSON.parse(card.data) : null; } catch (e) { card.data = null; }
-        logOperation({ userType: req.user ? 'user' : 'admin', userId: uploaderUserId || req.admin?.id, username: req.user?.username || req.admin?.username, action: 'upload', targetType: 'card', targetId: id, ip: req.ip, details: { name } });
-
-        let newCredits = null;
-        if (req.user) {
-            db.prepare('UPDATE users SET download_credits = download_credits + 3 WHERE id = ?').run(req.user.id);
-            newCredits = db.prepare('SELECT download_credits FROM users WHERE id = ?').get(req.user.id)?.download_credits;
-        }
-        res.json([card, ...(newCredits !== null ? [{ new_credits: newCredits }] : [])]);
-    } catch (err) {
-        console.error('Create card error:', err);
-        res.status(500).json({ error: '创建卡片失败' });
-    }
-});
-
-app.delete('/api/cards/:id', (req, res) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: '请先登录' });
-    }
-    try {
-        const token = authHeader.split(' ')[1];
-        let isAdmin = false;
-        let userId = null;
-        let username = '';
-        try {
-            const decoded = jwt.verify(token, JWT_SECRET);
-            if (decoded.role === 'admin') {
-                isAdmin = true;
-                userId = decoded.id;
-                username = decoded.username || '';
-            } else {
-                userId = decoded.id;
-                username = decoded.username || '';
-            }
-        } catch {
-            return res.status(401).json({ error: '认证失败' });
-        }
-
-        const { id } = req.params;
-        const card = db.prepare('SELECT name, uploader_user_id FROM character_cards WHERE id = ?').get(id);
-        if (!card) {
-            return res.status(404).json({ error: '卡片不存在' });
-        }
-
-        // Only admin or card owner can delete
-        const ownerUserId = card.uploader_user_id == null ? null : Number(card.uploader_user_id);
-        if (!isAdmin && (!userId || ownerUserId !== Number(userId))) {
-            return res.status(403).json({ error: '无权删除此卡片' });
-        }
-
-        const deleteAndReclaim = db.transaction(() => {
-            db.prepare('DELETE FROM character_cards WHERE id = ?').run(id);
-            // Reclaim upload credits (3) from uploader, minimum 0
-            if (card.uploader_user_id) {
-                db.prepare('UPDATE users SET download_credits = MAX(0, download_credits - 3) WHERE id = ?').run(card.uploader_user_id);
-            }
-        });
-        deleteAndReclaim();
-        thumbnailCache.delete(id);
-
-        logOperation({ userType: isAdmin ? 'admin' : 'user', userId, username, action: 'delete', targetType: 'card', targetId: id, ip: req.ip, details: { name: card?.name } });
-        res.json([{ id }]);
-    } catch (err) {
-        console.error('Delete card error:', err);
-        res.status(500).json({ error: '删除卡片失败' });
-    }
-});
-
-app.put('/api/cards/:id', (req, res) => {
-    // Authenticate: card owner OR admin
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: '请先登录' });
-    }
-    try {
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const card = db.prepare('SELECT * FROM character_cards WHERE id = ?').get(req.params.id);
-        if (!card) return res.status(404).json({ error: '卡片不存在' });
-
-        let userType, userId, username;
-        if (decoded.role === 'admin') {
-            userType = 'admin'; userId = decoded.id; username = decoded.username;
-        } else if (decoded.role === 'user' && card.uploader_user_id === decoded.id) {
-            userType = 'user'; userId = decoded.id; username = decoded.username;
-        } else {
-            return res.status(403).json({ error: '无权编辑此卡片' });
-        }
-
-        const { name, description, avatar_url, data, creator_notes, created_at } = req.body;
-        const fields = [];
-        const values = [];
-        if (name !== undefined)          { fields.push('name = ?');          values.push(name); }
-        if (description !== undefined)   { fields.push('description = ?');   values.push(description); }
-        if (avatar_url !== undefined && avatar_url.startsWith('data:')) { fields.push('avatar_url = ?'); values.push(avatar_url); }
-        if (data !== undefined) {
-            let serializedData;
-            try {
-                serializedData = typeof data === 'string' ? data : JSON.stringify(data);
-                JSON.parse(serializedData);
-            } catch (parseError) {
-                return res.status(400).json({ error: '卡片数据格式无效' });
-            }
-            fields.push('data = ?');
-            values.push(serializedData);
-        }
-        if (creator_notes !== undefined) { fields.push('creator_notes = ?'); values.push(creator_notes); }
-        if (created_at !== undefined && decoded.role === 'admin') {
-            if (isNaN(Date.parse(created_at))) return res.status(400).json({ error: '无效的时间格式' });
-            fields.push('created_at = ?'); values.push(created_at);
-        }
-
-        if (fields.length === 0) return res.status(400).json({ error: '无更新内容' });
-        values.push(req.params.id);
-        db.prepare(`UPDATE character_cards SET ${fields.join(', ')} WHERE id = ?`).run(...values);
-        thumbnailCache.delete(req.params.id);
-
-        logOperation({ userType, userId, username, action: 'edit', targetType: 'card', targetId: req.params.id, ip: req.ip, details: { name: card.name } });
-
-        const updated = db.prepare('SELECT * FROM character_cards WHERE id = ?').get(req.params.id);
-        try { updated.data = updated.data ? JSON.parse(updated.data) : null; } catch (e) { updated.data = null; }
-        res.json([updated]);
-    } catch (err) {
-        if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {
-            return res.status(401).json({ error: '令牌无效或已过期' });
-        }
-        console.error('Update card error:', err);
-        res.status(500).json({ error: '更新卡片失败' });
-    }
-});
-
-app.post('/api/cards/:id/download', requireUserOrAdmin, (req, res) => {
-    try {
-        const { id } = req.params;
-        const card = db.prepare('SELECT id, name, uploader_user_id FROM character_cards WHERE id = ?').get(id);
-        if (!card) return res.status(404).json({ error: '卡片不存在' });
-
-        let newCredits = null;
-        const recordDownload = db.transaction(() => {
-            if (!req.admin) {
-                const isOwner = req.user && card.uploader_user_id === req.user.id;
-                if (!isOwner) {
-                    const result = db.prepare('UPDATE users SET download_credits = download_credits - 1 WHERE id = ? AND download_credits > 0').run(req.user.id);
-                    if (result.changes === 0) {
-                        const error = new Error('下载次数不足');
-                        error.statusCode = 403;
-                        throw error;
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <!-- Disable HTML caching so clients always receive the latest UI logic. -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>万相广场</title>
+    <script src="/tailwind.js"></script>
+    <script src="/vue.global.js"></script>
+    <!-- Local API backend replaces Supabase -->
+    <script src="/marked.min.js"></script>
+    <script src="/purify.min.js"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['PingFang SC', 'system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'Helvetica Neue', 'Arial', 'Noto Sans', 'sans-serif', 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji'],
+                    },
+                    colors: {
+                        gray: {
+                            50: '#f9fafb',
+                            100: '#f3f4f6',
+                            200: '#e5e7eb',
+                            300: '#d1d5db',
+                            400: '#9ca3af',
+                            500: '#6b7280',
+                            600: '#4b5563',
+                            700: '#374151',
+                            800: '#1f2937',
+                            900: '#111827',
+                        },
+                        primary: {
+                            50: '#eff6ff',
+                            100: '#dbeafe',
+                            200: '#bfdbfe',
+                            300: '#93c5fd',
+                            400: '#60a5fa',
+                            500: '#3b82f6',
+                            600: '#2563eb',
+                            700: '#1d4ed8',
+                            800: '#1e40af',
+                            900: '#1e3a8a',
+                        }
+                    },
+                    animation: {
+                        'fade-in': 'fadeIn 0.3s ease-out',
+                        'slide-up': 'slideUp 0.3s ease-out',
+                        'slide-down': 'slideDown 0.3s ease-out',
+                        'scale-in': 'scaleIn 0.2s ease-out',
+                        'detail-scale-in': 'detailScaleIn 0.48s cubic-bezier(0.22, 1, 0.36, 1)',
+                        'slide-up-mobile': 'slideUpMobile 0.5s cubic-bezier(0.32, 0.72, 0, 1)',
+                        'detail-slide-up-mobile': 'detailSlideUpMobile 0.72s cubic-bezier(0.22, 1, 0.36, 1)',
+                        'zoom-in': 'zoomIn 0.3s ease-out',
+                    },
+                    keyframes: {
+                        fadeIn: {
+                            '0%': { opacity: '0' },
+                            '100%': { opacity: '1' },
+                        },
+                        slideUp: {
+                            '0%': { transform: 'translateY(20px)', opacity: '0' },
+                            '100%': { transform: 'translateY(0)', opacity: '1' },
+                        },
+                        slideDown: {
+                            '0%': { transform: 'translateY(-20px)', opacity: '0' },
+                            '100%': { transform: 'translateY(0)', opacity: '1' },
+                        },
+                        scaleIn: {
+                            '0%': { transform: 'scale(0.95)', opacity: '0' },
+                            '100%': { transform: 'scale(1)', opacity: '1' },
+                        },
+                        detailScaleIn: {
+                            '0%': { transform: 'scale(0.94) translateY(18px)', opacity: '0' },
+                            '100%': { transform: 'scale(1) translateY(0)', opacity: '1' },
+                        },
+                        slideUpMobile: {
+                            '0%': { transform: 'translateY(100%)' },
+                            '100%': { transform: 'translateY(0)' },
+                        },
+                        detailSlideUpMobile: {
+                            '0%': { transform: 'translateY(100%)' },
+                            '100%': { transform: 'translateY(0)' },
+                        },
+                        zoomIn: {
+                            '0%': { transform: 'scale(0.9)', opacity: '0' },
+                            '100%': { transform: 'scale(1)', opacity: '1' },
+                        }
+                    },
+                    boxShadow: {
+                        'soft': '0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03)',
+                        'card': '0 0 0 1px rgba(0,0,0,0.03), 0 2px 8px rgba(0,0,0,0.04)',
                     }
                 }
-                newCredits = db.prepare('SELECT download_credits FROM users WHERE id = ?').get(req.user.id)?.download_credits ?? null;
             }
-
-            db.prepare('UPDATE character_cards SET downloads_count = downloads_count + 1 WHERE id = ?').run(id);
-        });
-
-        recordDownload();
-        logOperation({ userType: req.user ? 'user' : 'admin', userId: req.user?.id || req.admin?.id, username: req.user?.username || req.admin?.username, action: 'download', targetType: 'card', targetId: id, ip: req.ip });
-
-        const fileName = sanitizeDownloadFilename(card.name);
-        const downloadToken = createCardDownloadToken(id, fileName);
-        res.json({
-            success: true,
-            new_credits: newCredits,
-            download_url: `/api/cards/${id}/download/file?token=${encodeURIComponent(downloadToken)}`
-        });
-    } catch (err) {
-        if (err.statusCode) {
-            return res.status(err.statusCode).json({ error: err.message });
         }
-        console.error('Download count error:', err);
-        res.status(500).json({ error: '更新下载次数失败' });
-    }
-});
+    </script>
+    <style>
+        [v-cloak] { display: none !important; }
 
-app.get('/api/cards/:id/download/file', async (req, res) => {
-    try {
-        const token = typeof req.query.token === 'string' ? req.query.token : '';
-        if (!token) {
-            return res.status(401).json({ error: '下载链接无效或已过期' });
+        /* Hide scrollbar globally but keep functionality */
+        ::-webkit-scrollbar {
+            display: none;
+        }
+        * {
+            -ms-overflow-style: none;  /* IE and Edge */
+            scrollbar-width: none;  /* Firefox */
         }
 
-        const decoded = jwt.verify(token, JWT_SECRET);
-        if (decoded.role !== 'card-download' || decoded.cardId !== req.params.id) {
-            return res.status(403).json({ error: '下载链接无效或已过期' });
+        html {
+            -webkit-text-size-adjust: 100% !important;
+            -moz-text-size-adjust: 100% !important;
+            -ms-text-size-adjust: 100% !important;
+            text-size-adjust: 100% !important;
+            font-size: 100% !important;
         }
 
-        const card = db.prepare('SELECT id, name, avatar_url, data FROM character_cards WHERE id = ?').get(req.params.id);
-        if (!card) {
-            return res.status(404).json({ error: '卡片不存在' });
+        html, body {
+            overscroll-behavior-y: none;
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
         }
 
-        try {
-            card.data = card.data ? JSON.parse(card.data) : null;
-        } catch {
-            card.data = null;
+        body {
+            background-color: #f9fafb;
+            color: #1f2937;
+            font-family: 'PingFang SC', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji' !important;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
         }
 
-        const fileBuffer = await buildCardDownloadFile(card);
-        const fileName = sanitizeDownloadFilename(decoded.fileName || card.name);
-        res.set('Content-Type', 'image/png');
-        res.set('Cache-Control', 'no-store');
-        res.set('Content-Disposition', createAttachmentDisposition(fileName));
-        res.send(fileBuffer);
-    } catch (err) {
-        if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {
-            return res.status(401).json({ error: '下载链接无效或已过期' });
-        }
-        console.error('Download file error:', err);
-        res.status(500).json({ error: '生成下载文件失败' });
-    }
-});
-
-// ============== Card Like Routes ==============
-app.post('/api/cards/:id/like', authenticateUser, (req, res) => {
-    try {
-        const cardId = req.params.id;
-        const userId = req.user.id;
-
-        const card = db.prepare('SELECT id FROM character_cards WHERE id = ?').get(cardId);
-        if (!card) return res.status(404).json({ error: '角色卡不存在' });
-
-        const existing = db.prepare('SELECT id FROM card_likes WHERE card_id = ? AND user_id = ?').get(cardId, userId);
-
-        if (existing) {
-            // Unlike
-            const unlikeTransaction = db.transaction(() => {
-                db.prepare('DELETE FROM card_likes WHERE card_id = ? AND user_id = ?').run(cardId, userId);
-                db.prepare('UPDATE character_cards SET likes_count = CASE WHEN likes_count > 0 THEN likes_count - 1 ELSE 0 END WHERE id = ?').run(cardId);
-            });
-            unlikeTransaction();
-
-            const updated = db.prepare('SELECT likes_count FROM character_cards WHERE id = ?').get(cardId);
-            return res.json({ liked: false, likes_count: updated.likes_count });
-        } else {
-            // Like
-            const likeTransaction = db.transaction(() => {
-                db.prepare('INSERT INTO card_likes (card_id, user_id) VALUES (?, ?)').run(cardId, userId);
-                db.prepare('UPDATE character_cards SET likes_count = likes_count + 1 WHERE id = ?').run(cardId);
-            });
-            likeTransaction();
-
-            const updated = db.prepare('SELECT likes_count FROM character_cards WHERE id = ?').get(cardId);
-            return res.json({ liked: true, likes_count: updated.likes_count });
-        }
-    } catch (err) {
-        console.error('Card like error:', err);
-        res.status(500).json({ error: '操作失败' });
-    }
-});
-
-// ============== Comment Routes ==============
-app.get('/api/cards/:cardId/comments', optionalUserAuth, (req, res) => {
-    try {
-        const cardId = req.params.cardId;
-        const userId = req.user ? req.user.id : null;
-
-        const comments = db.prepare(
-            `SELECT c.*, u.username as author_name,
-                    (SELECT cc2.uploader_user_id FROM character_cards cc2 WHERE cc2.id = c.card_id) as card_uploader_id
-             FROM character_comments c 
-             LEFT JOIN users u ON c.user_id = u.id 
-             WHERE c.card_id = ? 
-             ORDER BY c.created_at ASC`
-        ).all(cardId);
-
-        // Find the hot comment (highest likes >= 5)
-        const hotComment = db.prepare(
-            `SELECT id FROM character_comments 
-             WHERE card_id = ? AND likes_count >= 5 
-             ORDER BY likes_count DESC LIMIT 1`
-        ).get(cardId);
-
-        // Check which comments the current user has liked
-        let likedCommentIds = new Set();
-        if (userId) {
-            const liked = db.prepare(
-                'SELECT comment_id FROM comment_likes WHERE user_id = ? AND comment_id IN (SELECT id FROM character_comments WHERE card_id = ?)'
-            ).all(userId, cardId);
-            likedCommentIds = new Set(liked.map(l => l.comment_id));
+        .card-gradient {
+            background: linear-gradient(to bottom, rgba(0,0,0,0) 0%, rgba(0,0,0,0.8) 100%);
         }
 
-        const result = comments.map(c => ({
-            ...c,
-            user_liked: likedCommentIds.has(c.id),
-            is_hot: hotComment && hotComment.id === c.id
-        }));
-
-        res.json(result);
-    } catch (err) {
-        console.error('Fetch comments error:', err);
-        res.status(500).json({ error: '获取评论失败' });
-    }
-});
-
-app.post('/api/cards/:cardId/comments', authenticateUser, (req, res) => {
-    try {
-        const { content, reply_to_id } = req.body;
-        if (!content || !content.trim()) {
-            return res.status(400).json({ error: '评论内容不能为空' });
+        /* Toast Transitions */
+        .list-enter-active,
+        .list-leave-active {
+            transition: all 0.4s ease;
         }
-        if (content.trim().length < 5) {
-            return res.status(400).json({ error: '评论内容不能少于5个字' });
+        .list-enter-from,
+        .list-leave-to {
+            opacity: 0;
+            transform: translateY(-20px);
         }
-        if (content.length > 5000) {
-            return res.status(400).json({ error: '评论内容过长（最多5000字）' });
+
+        /* Fade Animation */
+        .fade-enter-active,
+        .fade-leave-active {
+            transition: opacity 0.3s ease;
+        }
+        .fade-enter-from,
+        .fade-leave-to {
+            opacity: 0;
+        }
+
+        /* Typography Improvements for Markdown */
+        .prose {
+            color: #374151;
+            max-width: none;
         }
         
-        const userId = req.user.id;
-        const user = db.prepare('SELECT username, download_credits FROM users WHERE id = ?').get(userId);
-        if (!user) return res.status(401).json({ error: '用户不存在' });
-
-        const id = generateId();
-        const now = new Date().toISOString();
-
-        // Resolve reply info
-        let replyToName = null;
-        if (reply_to_id) {
-            const replyComment = db.prepare('SELECT c.id, u.username FROM character_comments c LEFT JOIN users u ON c.user_id = u.id WHERE c.id = ?').get(reply_to_id);
-            if (replyComment) replyToName = replyComment.username || '匿名用户';
+        /* Mobile Bottom Sheet Smoothness */
+        .scroll-smooth-mobile {
+            -webkit-overflow-scrolling: touch;
+            overscroll-behavior: contain;
+            touch-action: pan-y;
         }
 
-        // Insert comment and add 2 credits in a transaction
-        const insertComment = db.transaction(() => {
-            db.prepare(
-                'INSERT INTO character_comments (id, card_id, user_id, nickname, content, reply_to_id, reply_to_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-            ).run(id, req.params.cardId, userId, user.username, content.trim(), reply_to_id || null, replyToName, now);
-
-            db.prepare('UPDATE users SET download_credits = download_credits + 2 WHERE id = ?').run(userId);
-        });
-        insertComment();
-
-        const comment = db.prepare('SELECT * FROM character_comments WHERE id = ?').get(id);
-        comment.author_name = user.username;
-        comment.user_liked = false;
-        comment.is_hot = false;
-        comment.card_uploader_id = db.prepare('SELECT uploader_user_id FROM character_cards WHERE id = ?').get(req.params.cardId)?.uploader_user_id || null;
-
-        const updatedUser = db.prepare('SELECT download_credits FROM users WHERE id = ?').get(userId);
-        res.json({ comment, new_credits: updatedUser.download_credits });
-    } catch (err) {
-        console.error('Create comment error:', err);
-        res.status(500).json({ error: '发布评论失败' });
-    }
-});
-
-// ============== Comment Like Routes ==============
-app.post('/api/comments/:id/like', authenticateUser, (req, res) => {
-    try {
-        const commentId = req.params.id;
-        const userId = req.user.id;
-
-        // Check if comment exists
-        const comment = db.prepare('SELECT id, card_id FROM character_comments WHERE id = ?').get(commentId);
-        if (!comment) return res.status(404).json({ error: '评论不存在' });
-
-        // Check if already liked
-        const existing = db.prepare('SELECT id FROM comment_likes WHERE comment_id = ? AND user_id = ?').get(commentId, userId);
-
-        if (existing) {
-            // Unlike: remove like and deduct credit
-            const unlikeTransaction = db.transaction(() => {
-                db.prepare('DELETE FROM comment_likes WHERE comment_id = ? AND user_id = ?').run(commentId, userId);
-                db.prepare('UPDATE character_comments SET likes_count = CASE WHEN likes_count > 0 THEN likes_count - 1 ELSE 0 END WHERE id = ?').run(commentId);
-                // Don't deduct credits on unlike (credit was already earned)
-            });
-            unlikeTransaction();
-
-            const updated = db.prepare('SELECT likes_count FROM character_comments WHERE id = ?').get(commentId);
-            return res.json({ liked: false, likes_count: updated.likes_count });
-        } else {
-            // Like: add like
-            const likeTransaction = db.transaction(() => {
-                db.prepare('INSERT INTO comment_likes (comment_id, user_id) VALUES (?, ?)').run(commentId, userId);
-                db.prepare('UPDATE character_comments SET likes_count = likes_count + 1 WHERE id = ?').run(commentId);
-            });
-            likeTransaction();
-
-            const updated = db.prepare('SELECT likes_count FROM character_comments WHERE id = ?').get(commentId);
-            return res.json({ liked: true, likes_count: updated.likes_count });
-        }
-    } catch (err) {
-        console.error('Like error:', err);
-        res.status(500).json({ error: '操作失败' });
-    }
-});
-
-app.delete('/api/comments/:id', authenticateAdmin, (req, res) => {
-    try {
-        const result = db.prepare('DELETE FROM character_comments WHERE id = ?').run(req.params.id);
-        if (result.changes === 0) {
-            return res.status(404).json({ error: '评论不存在' });
-        }
-        res.json({ success: true });
-    } catch (err) {
-        console.error('Delete comment error:', err);
-        res.status(500).json({ error: '删除评论失败' });
-    }
-});
-
-// ============== Admin Routes ==============
-app.get('/api/admin/stats', authenticateAdmin, (req, res) => {
-    try {
-        const totalCards = db.prepare('SELECT COUNT(*) as count FROM character_cards').get().count;
-        const totalComments = db.prepare('SELECT COUNT(*) as count FROM character_comments').get().count;
-        const totalDownloads = db.prepare('SELECT COALESCE(SUM(downloads_count), 0) as count FROM character_cards').get().count;
-        const totalUsers = db.prepare('SELECT COUNT(*) as count FROM users').get().count;
-        const totalLikes = db.prepare('SELECT COALESCE(SUM(likes_count), 0) as count FROM character_comments').get().count;
-        const totalVisits = db.prepare('SELECT COUNT(*) as count FROM page_views').get().count;
-        const recentCards = db.prepare(
-            "SELECT COUNT(*) as count FROM character_cards WHERE created_at > datetime('now', '-7 days')"
-        ).get().count;
-        const recentComments = db.prepare(
-            "SELECT COUNT(*) as count FROM character_comments WHERE created_at > datetime('now', '-7 days')"
-        ).get().count;
-        const todayNewUsers = db.prepare("SELECT COUNT(*) as count FROM users WHERE created_at >= date('now')").get().count;
-        const todayNewCards = db.prepare("SELECT COUNT(*) as count FROM character_cards WHERE created_at >= date('now')").get().count;
-        const todayNewComments = db.prepare("SELECT COUNT(*) as count FROM character_comments WHERE created_at >= date('now')").get().count;
-        const loginAttempts = db.prepare(
-            "SELECT COUNT(*) as count FROM login_attempts WHERE success = 0 AND attempt_time > datetime('now', '-24 hours')"
-        ).get().count;
-        const topCards = db.prepare(
-            'SELECT id, name, downloads_count FROM character_cards ORDER BY downloads_count DESC LIMIT 10'
-        ).all();
-
-        // 7-day daily activity from operation_logs
-        const dailyActivity = db.prepare(`
-            SELECT date(created_at) as day,
-                SUM(CASE WHEN action='upload' THEN 1 ELSE 0 END) as uploads,
-                SUM(CASE WHEN action='download' THEN 1 ELSE 0 END) as downloads,
-                SUM(CASE WHEN action='register' THEN 1 ELSE 0 END) as registers,
-                SUM(CASE WHEN action='login' THEN 1 ELSE 0 END) as logins
-            FROM operation_logs
-            WHERE created_at >= date('now', '-6 days')
-            GROUP BY date(created_at)
-            ORDER BY day ASC
-        `).all();
-
-        // 7-day daily comments
-        const dailyComments = db.prepare(`
-            SELECT date(created_at) as day, COUNT(*) as comments
-            FROM character_comments
-            WHERE created_at >= date('now', '-6 days')
-            GROUP BY date(created_at)
-        `).all();
-
-        // 7-day daily visits
-        const dailyVisits = db.prepare(`
-            SELECT date(created_at) as day, COUNT(*) as visits
-            FROM page_views
-            WHERE created_at >= date('now', '-6 days')
-            GROUP BY date(created_at)
-        `).all();
-
-        res.json({
-            totalCards, totalComments, totalDownloads, totalUsers, totalLikes, totalVisits,
-            recentCards, recentComments, todayNewUsers, todayNewCards, todayNewComments,
-            loginAttempts, topCards, dailyActivity, dailyComments, dailyVisits
-        });
-    } catch (err) {
-        console.error('Stats error:', err);
-        res.status(500).json({ error: '获取统计失败' });
-    }
-});
-
-app.get('/api/admin/cards', authenticateAdmin, (req, res) => {
-    try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 20;
-        const offset = (page - 1) * limit;
-        const search = req.query.search || '';
-
-        let query = 'SELECT id, name, description, creator_notes, downloads_count, created_at FROM character_cards';
-        let countQuery = 'SELECT COUNT(*) as count FROM character_cards';
-        const params = [];
-        const countParams = [];
-
-        if (search) {
-            const where = ' WHERE name LIKE ? OR description LIKE ? OR creator_notes LIKE ?';
-            const searchParam = `%${search}%`;
-            query += where;
-            countQuery += where;
-            params.push(searchParam, searchParam, searchParam);
-            countParams.push(searchParam, searchParam, searchParam);
+        .mobile-bg-img {
+            will-change: transform, filter, opacity;
+            transform: translateZ(0);
+            -webkit-backface-visibility: hidden;
+            backface-visibility: hidden;
+            transition: opacity 0.2s ease;
         }
 
-        const total = db.prepare(countQuery).get(...countParams).count;
-        query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-        params.push(limit, offset);
+        /* Sticky header effect for mobile modal content */
+        .sticky-trigger-zone {
+            position: sticky;
+            top: 0;
+            height: 1px;
+            width: 100%;
+        }
+        .prose p {
+            margin-top: 0.75em;
+            margin-bottom: 0.75em;
+            line-height: 1.75;
+        }
+        .prose p:first-child {
+            margin-top: 0;
+        }
+        .prose strong {
+            color: #111827;
+            font-weight: 700;
+        }
+        .prose em {
+            color: #4b5563;
+        }
+        .prose blockquote {
+            font-style: italic;
+            border-left-width: 0.25rem;
+            border-left-color: #e5e7eb;
+            margin-top: 1.6em;
+            margin-bottom: 1.6em;
+            padding-left: 1em;
+            color: #6b7280;
+            background: #f9fafb;
+            padding-top: 0.5em;
+            padding-bottom: 0.5em;
+            border-radius: 0 0.5rem 0.5rem 0;
+        }
+        .prose ul {
+            margin-top: 1.25em;
+            margin-bottom: 1.25em;
+            list-style-type: disc;
+            padding-left: 1.625em;
+        }
+        .prose li {
+            margin-top: 0.5em;
+            margin-bottom: 0.5em;
+        }
+        .prose code {
+            color: #111827;
+            font-weight: 600;
+            font-size: 0.875em;
+            background-color: #f3f4f6;
+            padding: 0.2em 0.4em;
+            border-radius: 0.25rem;
+        }
+        .prose h1, .prose h2, .prose h3, .prose h4 {
+            color: #111827;
+            font-weight: 700;
+            margin-top: 1.5em;
+            margin-bottom: 0.5em;
+            line-height: 1.3;
+        }
+        .prose h1 { font-size: 1.5em; }
+        .prose h2 { font-size: 1.25em; }
+        .prose h3 { font-size: 1.125em; }
 
-        const cards = db.prepare(query).all(...params);
-        res.json({ cards, total, page, limit, totalPages: Math.ceil(total / limit) });
-    } catch (err) {
-        console.error('Admin cards error:', err);
-        res.status(500).json({ error: '获取卡片列表失败' });
-    }
-});
+        /* HTML Card Container Styles */
+        .html-card-container {
+            width: 100%;
+            padding: 0 !important;
+            margin: 0 !important;
+            max-width: none;
+            min-width: 0;
+            overflow: hidden !important;
+            isolation: isolate;
+        }
+        .html-card-container iframe {
+            width: 100%;
+            max-width: 100%;
+            border: none;
+            display: block;
+            overflow: hidden;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-900 font-sans selection:bg-primary-200 selection:text-primary-900">
+    <div id="app" v-cloak class="min-h-screen flex flex-col">
+        <!-- Toast Notification Container -->
+        <div class="fixed top-6 left-1/2 transform -translate-x-1/2 z-[100] flex flex-col gap-2 pointer-events-none items-center">
+            <transition-group name="list" tag="div" class="flex flex-col items-center">
+                <div v-for="toast in toasts" :key="toast.id"
+                     class="pointer-events-auto flex items-center px-6 py-3 mb-2 rounded-full shadow-lg border bg-white text-gray-800 min-w-[300px] transform transition-all duration-300 backdrop-blur-sm bg-opacity-95"
+                     :class="{
+                        'border-green-200 text-green-800 bg-green-50': toast.type === 'success',
+                        'border-red-200 text-red-800 bg-red-50': toast.type === 'error',
+                        'border-blue-200 text-blue-800 bg-blue-50': toast.type === 'info',
+                        'border-yellow-200 text-yellow-800 bg-yellow-50': toast.type === 'warning'
+                     }">
+                    <div class="mr-3">
+                        <svg v-if="toast.type === 'success'" class="w-6 h-6 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+                        <svg v-if="toast.type === 'error'" class="w-6 h-6 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                        <svg v-if="toast.type === 'info'" class="w-6 h-6 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        <svg v-if="toast.type === 'warning'" class="w-6 h-6 text-yellow-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                    </div>
+                    <div class="flex-1 text-sm font-medium">{{ toast.message }}</div>
+                </div>
+            </transition-group>
+        </div>
 
-app.delete('/api/admin/cards/:id', authenticateAdmin, (req, res) => {
-    try {
-        const card = db.prepare('SELECT name, uploader_user_id FROM character_cards WHERE id = ?').get(req.params.id);
-        if (!card) return res.status(404).json({ error: '卡片不存在' });
-        const deleteAndReclaim = db.transaction(() => {
-            db.prepare('DELETE FROM character_cards WHERE id = ?').run(req.params.id);
-            if (card.uploader_user_id) {
-                db.prepare('UPDATE users SET download_credits = MAX(0, download_credits - 3) WHERE id = ?').run(card.uploader_user_id);
+        <!-- Header -->
+        <header class="bg-white/80 backdrop-blur-md border-b border-gray-200 sticky top-0 z-30 transition-all duration-300">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+                <div class="flex items-center gap-3 select-none">
+                    <div @click="handleLogoClick"
+                         class="w-10 h-10 bg-primary-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-primary-200 transform transition-all active:scale-90 hover:scale-105 cursor-pointer overflow-hidden relative">
+                        <svg class="w-6 h-6 relative z-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"></path></svg>
+                        <div v-if="isAdmin" class="absolute inset-0 bg-yellow-400 opacity-20 animate-pulse"></div>
+                    </div>
+                    <!-- Tabs in Header -->
+                    <div class="flex bg-gray-100 p-1 rounded-xl gap-1 ml-1">
+                        <button @click="currentTab = 'all'"
+                                class="px-3 py-1.5 rounded-lg text-sm font-bold transition-all"
+                                :class="currentTab === 'all' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'">
+                            广场
+                        </button>
+                        <button @click="currentTab = 'mine'"
+                                class="px-3 py-1.5 rounded-lg text-sm font-bold transition-all"
+                                :class="currentTab === 'mine' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'">
+                            我的
+                        </button>
+                    </div>
+                    <span v-if="isAdmin" class="hidden sm:inline-block text-[10px] font-bold text-yellow-600 bg-yellow-50 px-2 py-1 rounded-full border border-yellow-100 ml-2 cursor-pointer" @click="handleAdminLogout" title="点击退出管理员模式">ADMIN 模式</span>
+                </div>
+                
+                <div class="flex items-center gap-2 sm:gap-4">
+                    <button @click="showSearchModal = true" class="text-gray-500 hover:text-gray-900 hover:bg-gray-50 px-3 sm:px-4 py-2 sm:py-2.5 rounded-2xl text-sm font-bold transition-all active:scale-95 flex items-center gap-2 group">
+                        <svg class="w-5 h-5 text-gray-500 group-hover:text-primary-600 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                        <span class="hidden sm:inline">搜索</span>
+                    </button>
+                    <button @click="handleUploadClick" class="bg-primary-600 hover:bg-primary-700 text-white px-5 sm:px-6 py-2 sm:py-2.5 rounded-2xl text-sm font-bold transition-all shadow-md hover:shadow-lg active:scale-95 flex items-center gap-2">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                        上传
+                    </button>
+                    <!-- User Auth Button -->
+                    <div v-if="isLoggedIn" class="flex items-center gap-1">
+                        <div class="hidden sm:flex items-center gap-1.5 bg-blue-50 px-3 py-1.5 rounded-xl border border-blue-100">
+                            <svg class="w-3.5 h-3.5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                            <span class="text-xs font-bold text-blue-600">{{ downloadCredits }}</span>
+                        </div>
+                        <button @click="handleUserLogout" class="flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-bold text-gray-600 hover:bg-gray-100 transition-all" :title="currentUser.username">
+                            <div class="w-6 h-6 bg-primary-100 text-primary-700 rounded-full flex items-center justify-center text-xs font-black">{{ currentUser.username.charAt(0).toUpperCase() }}</div>
+                            <span class="hidden sm:inline text-xs">{{ currentUser.username }}</span>
+                        </button>
+                    </div>
+                    <button v-else @click="showUserAuthModal = true; userAuthMode = 'login'" class="flex items-center gap-1.5 px-3 sm:px-4 py-2 sm:py-2.5 rounded-2xl text-sm font-bold text-gray-600 hover:text-gray-900 hover:bg-gray-50 transition-all active:scale-95">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+                        <span class="hidden sm:inline">登录</span>
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <!-- Main Content -->
+        <main class="flex-1 max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-4 w-full">
+            
+            <!-- Credits Banner (Only in Mine Tab) -->
+            <div v-if="currentTab === 'mine'" class="mb-6 bg-white border border-blue-100 rounded-2xl p-4 sm:p-5 shadow-sm shadow-blue-100 animate-fade-in relative overflow-hidden group">
+                <div class="absolute right-0 top-0 w-32 h-32 bg-blue-50 rounded-full -mr-10 -mt-10 blur-2xl opacity-60 group-hover:opacity-100 transition-opacity duration-500"></div>
+
+                <!-- Row 1: icon + credits number -->
+                <div class="flex items-center gap-4 mb-3 relative z-10">
+                    <div class="w-10 h-10 rounded-2xl bg-blue-50 text-primary-600 flex items-center justify-center flex-shrink-0 border border-blue-100 shadow-sm">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                    </div>
+                    <div>
+                        <div class="text-[10px] font-bold text-blue-400 uppercase tracking-wider mb-0.5">下载额度</div>
+                        <div class="flex items-baseline gap-1">
+                            <span v-if="isAdmin" class="text-2xl font-black text-gray-800">&infin;</span>
+                            <span v-else class="text-2xl font-black text-gray-800 font-mono tracking-tight">{{ downloadCredits }}</span>
+                            <span v-if="!isAdmin" class="text-xs font-bold text-gray-400">次</span>
+                        </div>
+                    </div>
+                    <!-- visit count right aligned (admin only) -->
+                    <div v-if="isAdmin && totalVisits > 0" class="ml-auto flex items-center gap-1 text-[11px] text-gray-400">
+                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path></svg>
+                        <span class="font-mono font-bold">{{ totalVisits }}</span> 次访问
+                    </div>
+                </div>
+
+                <!-- Row 2: earn badges, wraps on mobile -->
+                <div class="flex flex-wrap gap-1.5 relative z-10">
+                    <div class="px-2.5 py-1 bg-blue-50 text-blue-600 border border-blue-100 text-xs font-bold rounded-xl whitespace-nowrap flex items-center gap-1">
+                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                        发布 +3
+                    </div>
+                    <div class="px-2.5 py-1 bg-purple-50 text-purple-600 border border-purple-100 text-xs font-bold rounded-xl whitespace-nowrap flex items-center gap-1">
+                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+                        注册 +1
+                    </div>
+                    <div class="px-2.5 py-1 bg-green-50 text-green-600 border border-green-100 text-xs font-bold rounded-xl whitespace-nowrap flex items-center gap-1">
+                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path></svg>
+                        评论 +2
+                    </div>
+                </div>
+            </div>
+
+            <!-- Sort + Tags row -->
+            <div v-if="!loading" class="mb-5 animate-fade-in">
+                <div class="flex items-start gap-2">
+                    <!-- Sort dropdown (outside overflow container) -->
+                    <div class="relative flex-shrink-0">
+                        <button @click.stop="showSortDropdown = !showSortDropdown" class="flex items-center gap-1 px-2.5 py-1.5 bg-gray-100 rounded-xl text-xs font-bold transition-all hover:bg-gray-200">
+                            <svg v-if="cardSort === 'latest'" class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            <svg v-else class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+                            <span :class="cardSort === 'hot' ? 'text-rose-500' : 'text-primary-600'">{{ cardSort === 'latest' ? '最新' : '热门' }}</span>
+                            <svg class="w-3 h-3 text-gray-400 transition-transform" :class="showSortDropdown ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                        </button>
+                        <div v-if="showSortDropdown" class="absolute top-full left-0 mt-1 bg-white rounded-xl shadow-lg border border-gray-100 py-1 z-30 min-w-[5rem]">
+                            <button @click="cardSort = 'latest'; showSortDropdown = false" class="w-full flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold transition-all hover:bg-gray-50" :class="cardSort === 'latest' ? 'text-primary-600' : 'text-gray-500'">
+                                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                最新
+                            </button>
+                            <button @click="cardSort = 'hot'; showSortDropdown = false" class="w-full flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold transition-all hover:bg-gray-50" :class="cardSort === 'hot' ? 'text-rose-500' : 'text-gray-500'">
+                                <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+                                热门
+                            </button>
+                        </div>
+                    </div>
+                    <div class="flex-1 min-w-0">
+                        <div class="flex items-center gap-2" :class="tagsExpanded ? 'flex-wrap' : 'flex-nowrap overflow-hidden'">
+                            <!-- Tags (only on non-mine tab) -->
+                            <template v-if="currentTab !== 'mine' && visiblePopularTags.length > 0">
+                                <button v-for="tag in visiblePopularTags" :key="tag"
+                                @click="searchTag(tag)"
+                                class="px-3 py-1.5 rounded-xl text-xs font-bold transition-all duration-200 border active:scale-95 flex-shrink-0 max-w-[5.5rem] sm:max-w-[7rem] lg:max-w-[8rem] truncate"
+                                :class="searchQuery === tag
+                                    ? 'bg-primary-500 text-white border-primary-500 shadow-md shadow-primary-200'
+                                    : 'bg-white text-gray-500 border-gray-200 hover:border-primary-300 hover:text-primary-600 hover:bg-primary-50'">
+                            #{{ tag }}
+                        </button>
+                            </template>
+                        </div>
+                    </div>
+                    <button v-if="currentTab !== 'mine' && showPopularTagsToggle"
+                            @click="tagsExpanded = !tagsExpanded"
+                            class="mt-1 flex items-center gap-0.5 text-xs font-bold text-gray-400 hover:text-primary-500 transition-colors flex-shrink-0">
+                        <svg class="w-3.5 h-3.5 transition-transform duration-200" :class="tagsExpanded ? 'rotate-180' : ''"
+                             fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M19 9l-7 7-7-7"/>
+                        </svg>
+                        {{ tagsExpanded ? '收起' : '展开' }}
+                    </button>
+                </div>
+            </div>
+
+            <!-- Loading State -->
+            <div v-if="loading" class="fixed inset-0 z-50 flex flex-col items-center justify-center pointer-events-none animate-fade-in">
+                <div class="relative">
+                    <div class="w-16 h-16 border-4 border-primary-100 rounded-full"></div>
+                    <div class="w-16 h-16 border-4 border-primary-600 border-t-transparent rounded-full animate-spin absolute top-0 left-0"></div>
+                </div>
+                <p class="mt-6 text-gray-500 font-medium">正在加载角色卡...</p>
+            </div>
+
+            <!-- Empty State -->
+            <div v-else-if="filteredCards.length === 0" class="text-center py-32 animate-fade-in">
+                <div class="w-24 h-24 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-6 text-gray-300">
+                    <svg class="w-12 h-12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+                </div>
+                <h3 class="text-xl font-bold text-gray-800 mb-2">没有找到匹配的角色卡</h3>
+                <p class="text-gray-500 max-w-xs mx-auto mb-8">换个关键词试试，或上传您的第一张角色卡！</p>
+                <button @click="searchQuery = ''" class="px-6 py-2 bg-primary-50 text-primary-600 rounded-xl font-bold hover:bg-primary-100 transition-colors">
+                    清除搜索条件
+                </button>
+            </div>
+
+            <!-- Card List -->
+            <div v-else class="flex flex-col gap-4 animate-fade-in">
+
+                <div v-for="card in pagedCards" :key="card.id"
+                     @click="previewCard(card)"
+                     class="group relative flex bg-white rounded-3xl border border-gray-100 shadow-sm hover:shadow-lg hover:shadow-primary-500/5 transition-all duration-300 cursor-pointer hover:border-primary-100 min-h-[12rem] sm:min-h-[16rem] h-auto overflow-hidden">
+                    
+                    <!-- Avatar (3:4 Ratio, Zero Padding) -->
+                    <div class="relative w-[7.5rem] sm:w-48 flex-shrink-0 bg-gray-100">
+                        <div class="absolute inset-0 flex items-center justify-center">
+                            <div class="animate-spin rounded-full h-6 w-6 border-2 border-primary-300 border-t-transparent"></div>
+                        </div>
+                        <img :src="card.thumbnail_url || card.avatar_url || defaultAvatar" class="absolute inset-0 w-full h-full object-cover transition-opacity duration-300" @load="$event.target.style.opacity = 1" @error="if ($event.target.dataset.fullAvatarTried !== '1' && card.avatar_url && $event.target.src !== card.avatar_url) { $event.target.dataset.fullAvatarTried = '1'; $event.target.src = card.avatar_url; return; } if ($event.target.dataset.fallback === '1') return; $event.target.dataset.fallback = '1'; $event.target.src = defaultAvatar; $event.target.style.opacity = 1" style="opacity: 0">
+                        
+                        <!-- Download Count (Admin Only) - Moved to Avatar Bottom Right -->
+                        <div v-if="isAdmin" class="absolute bottom-2 right-2 bg-black/50 backdrop-blur-md text-white text-[10px] font-bold px-2 py-1 rounded-lg flex items-center gap-1 border border-white/20 shadow-lg">
+                            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                            {{ card.downloads_count || 0 }}
+                        </div>
+                    </div>
+
+                    <!-- Info -->
+                    <div class="flex-1 p-3 sm:p-5 flex flex-col min-w-0">
+                        <div class="flex flex-col gap-2">
+                            <div class="flex justify-between items-start gap-2">
+                                <h3 class="flex-1 min-w-0 font-bold text-lg sm:text-xl text-gray-900 group-hover:text-primary-600 transition-colors line-clamp-2 leading-tight break-words">{{ card.name }}</h3>
+                                
+                                <div class="flex items-center gap-1 flex-shrink-0 ml-1">
+                                    <!-- Move Up/Down (Admin Only) -->
+                                    <div v-if="isAdmin" class="flex items-center gap-0.5">
+                                        <button @click.stop="moveCard(card, -1)"
+                                                class="p-1 text-gray-300 hover:text-primary-600 hover:bg-primary-50 rounded-lg transition-all md:opacity-0 md:group-hover:opacity-100 focus:opacity-100 flex-shrink-0"
+                                                title="上移">
+                                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"></path></svg>
+                                        </button>
+                                        <button @click.stop="moveCard(card, 1)"
+                                                class="p-1 text-gray-300 hover:text-primary-600 hover:bg-primary-50 rounded-lg transition-all md:opacity-0 md:group-hover:opacity-100 focus:opacity-100 flex-shrink-0"
+                                                title="下移">
+                                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                        </button>
+                                    </div>
+
+                                    <!-- Edit Button (Owner or Admin) -->
+                                    <button v-if="(isLoggedIn && currentUser && card.uploader_user_id === currentUser.id) || isAdmin"
+                                            @click.stop="startEditCard(card)"
+                                            class="p-1.5 text-gray-300 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all md:opacity-0 md:group-hover:opacity-100 focus:opacity-100 flex-shrink-0"
+                                            title="编辑">
+                                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                                    </button>
+
+                                    <!-- Delete Button (Only for my uploads or Admin) -->
+                                        <button v-if="(isLoggedIn && currentUser && card.uploader_user_id === currentUser.id) || isAdmin"
+                                            @click.stop="deleteCard(card)"
+                                            class="p-1.5 text-gray-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all md:opacity-0 md:group-hover:opacity-100 focus:opacity-100 flex-shrink-0 -mt-1 -mr-1"
+                                            title="删除">
+                                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Creator Note & Tags -->
+                            <div class="flex flex-col gap-1 mt-1.5">
+                                <!-- Tags -->
+                                <div v-if="card.tags && card.tags.length > 0" class="flex flex-nowrap sm:flex-wrap overflow-x-auto gap-1 no-scrollbar">
+                                    <span v-for="tag in card.tags" :key="tag"
+                                          class="px-1.5 py-0.5 rounded text-[10px] font-bold border border-blue-100 bg-blue-50 text-blue-600 leading-none flex-shrink-0">
+                                        {{ tag }}
+                                    </span>
+                                </div>
+                                <!-- Text Note -->
+                                <div v-if="card.clean_notes" class="flex items-center gap-1.5">
+                                    <svg class="w-3.5 h-3.5 text-primary-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z"></path></svg>
+                                    <p class="text-xs font-medium text-primary-600 line-clamp-1">{{ card.clean_notes }}</p>
+                                </div>
+                            </div>
+                            
+                            <!-- Description -->
+                            <div class="text-xs sm:text-sm text-gray-500 mt-2 leading-relaxed break-words whitespace-pre-line overflow-hidden relative" :class="card.creator_notes ? 'line-clamp-5 sm:line-clamp-6' : 'line-clamp-6 sm:line-clamp-[8]'">{{ renderCardPreview(card.description || '暂无描述') }}</div>
+                        </div>
+
+                        <!-- Like & Comment counts -->
+                        <div class="mt-auto pt-2 flex items-center justify-end gap-2">
+                            <span class="flex items-center gap-1 px-2 py-1 rounded-xl text-xs font-bold text-gray-400">
+                                <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path></svg>
+                                <span>{{ card.comment_count || 0 }}</span>
+                            </span>
+                            <button @click.stop="likeCard(card)"
+                                    class="flex items-center gap-1 px-2.5 py-1 rounded-xl text-xs font-bold transition-all hover:scale-105 active:scale-95"
+                                    :class="card.user_liked ? 'text-rose-500 bg-rose-50' : 'text-gray-400 hover:text-rose-400 hover:bg-rose-50'">
+                                <svg class="w-3.5 h-3.5 flex-shrink-0" :fill="card.user_liked ? 'currentColor' : 'none'" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+                                <span>{{ card.likes_count || 0 }}</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Pagination -->
+            <div v-if="!loading && totalPages > 0" class="mt-8 flex flex-col items-center gap-2">
+                <!-- Page buttons -->
+                <div class="flex items-center gap-1.5">
+                    <button @click="currentPage = 1" :disabled="currentPage === 1"
+                            class="px-2.5 py-1.5 rounded-xl text-xs font-bold border transition-all disabled:opacity-30"
+                            :class="currentPage === 1 ? 'text-gray-300 border-gray-100' : 'text-gray-500 border-gray-200 hover:border-primary-300 hover:text-primary-600'">
+                        «
+                    </button>
+                    <button @click="currentPage--" :disabled="currentPage === 1"
+                            class="px-2.5 py-1.5 rounded-xl text-xs font-bold border transition-all disabled:opacity-30"
+                            :class="currentPage === 1 ? 'text-gray-300 border-gray-100' : 'text-gray-500 border-gray-200 hover:border-primary-300 hover:text-primary-600'">
+                        ‹
+                    </button>
+                    <template v-for="p in pageNumbers" :key="p">
+                        <span v-if="p === '...'" class="px-1.5 text-xs text-gray-300 font-bold">···</span>
+                        <button v-else @click="currentPage = p"
+                                class="w-8 h-8 rounded-xl text-xs font-bold border transition-all"
+                                :class="currentPage === p ? 'bg-primary-500 text-white border-primary-500 shadow-sm' : 'text-gray-500 border-gray-200 hover:border-primary-300 hover:text-primary-600'">
+                            {{ p }}
+                        </button>
+                    </template>
+                    <button @click="currentPage++" :disabled="currentPage === totalPages"
+                            class="px-2.5 py-1.5 rounded-xl text-xs font-bold border transition-all disabled:opacity-30"
+                            :class="currentPage === totalPages ? 'text-gray-300 border-gray-100' : 'text-gray-500 border-gray-200 hover:border-primary-300 hover:text-primary-600'">
+                        ›
+                    </button>
+                    <button @click="currentPage = totalPages" :disabled="currentPage === totalPages"
+                            class="px-2.5 py-1.5 rounded-xl text-xs font-bold border transition-all disabled:opacity-30"
+                            :class="currentPage === totalPages ? 'text-gray-300 border-gray-100' : 'text-gray-500 border-gray-200 hover:border-primary-300 hover:text-primary-600'">
+                        »
+                    </button>
+                </div>
+                <!-- Total count below page buttons -->
+                <span class="text-xs font-bold text-gray-400">共 {{ filteredCards.length }} 张 · 第 {{ currentPage }} / {{ totalPages }} 页</span>
+            </div>
+        </main>
+        <!-- Search Modal -->
+        <div v-if="showSearchModal" class="fixed inset-0 z-50 flex items-start justify-center pt-24 px-4 bg-gray-900/60 backdrop-blur-sm animate-fade-in" @click.self="showSearchModal = false">
+            <div class="w-full max-w-xl bg-white rounded-[2rem] shadow-2xl overflow-hidden animate-slide-down">
+                <div class="p-5 sm:p-6">
+                    <div class="relative flex items-center">
+                        <svg class="w-5 h-5 text-gray-400 absolute left-4 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                        <input v-model="searchQuery" ref="searchInput" autofocus type="text" placeholder="搜索角色卡名称、描述或标签..." class="w-full bg-gray-50 border-2 border-transparent focus:bg-white focus:border-primary-500 rounded-2xl py-3 pl-12 pr-12 text-base outline-none transition-all placeholder-gray-400 font-medium">
+                        <button v-if="searchQuery" @click="searchQuery = ''" class="absolute right-4 text-gray-400 hover:text-gray-600 p-1 rounded-full hover:bg-gray-200 transition-all">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                        </button>
+                    </div>
+
+                    <!-- Popular Tags in Modal -->
+                    <div v-if="modalPopularTags.length > 0" class="mt-6">
+                        <div class="flex items-center gap-2 mb-3 px-1">
+                            <svg class="w-4 h-4 text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"></path></svg>
+                            <span class="text-xs font-bold text-gray-500 uppercase tracking-wider">热门标签</span>
+                        </div>
+                        <div class="flex flex-wrap gap-2 max-h-[144px] sm:max-h-[160px] overflow-hidden">
+                            <button v-for="tag in modalPopularTags" :key="tag"
+                                    @click="searchTag(tag); showSearchModal = false"
+                                    class="px-3 py-1.5 rounded-xl text-xs sm:text-sm font-bold transition-all duration-200 border active:scale-95"
+                                    :class="searchQuery === tag
+                                        ? 'bg-primary-500 text-white border-primary-500 shadow-md shadow-primary-200'
+                                        : 'bg-white text-gray-500 border-gray-200 hover:border-primary-300 hover:text-primary-600 hover:bg-primary-50'">
+                                #{{ tag }}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                <div class="bg-gray-50 px-6 py-4 border-t border-gray-100 flex justify-end">
+                    <button @click="showSearchModal = false" class="text-sm font-bold text-gray-500 hover:text-gray-800 px-4 py-2 rounded-xl hover:bg-gray-200 transition-all">关闭</button>
+                    <button @click="showSearchModal = false" class="ml-2 bg-primary-600 hover:bg-primary-700 text-white text-sm font-bold px-6 py-2 rounded-xl shadow-lg shadow-primary-200 transition-all active:scale-95">
+                        查看结果
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tag Library Modal -->
+        <div v-if="showTagLibrary" class="fixed inset-0 z-50 flex items-start justify-center pt-16 px-4 pb-4 bg-gray-900/60 backdrop-blur-sm animate-fade-in" @click.self="showTagLibrary = false">
+            <div class="w-full max-w-xl bg-white rounded-[2rem] shadow-2xl flex flex-col max-h-[80vh] animate-slide-down">
+                <div class="p-5 border-b border-gray-100 flex items-center justify-between flex-shrink-0">
+                    <div class="flex items-center gap-2">
+                        <svg class="w-5 h-5 text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"></path></svg>
+                        <span class="font-bold text-gray-800">标签库</span>
+                        <span class="text-xs font-bold text-gray-400 bg-gray-100 px-2 py-0.5 rounded-full">{{ allTags.length }} 个</span>
+                    </div>
+                    <button @click="showTagLibrary = false" class="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-full transition-all">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+                <div class="p-5 overflow-y-auto flex flex-wrap gap-2">
+                    <button v-for="item in allTags" :key="item.tag"
+                            @click="searchTag(item.tag); showTagLibrary = false"
+                            class="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all border active:scale-95"
+                            :class="searchQuery === item.tag
+                                ? 'bg-primary-500 text-white border-primary-500'
+                                : 'bg-white text-gray-600 border-gray-200 hover:border-primary-300 hover:text-primary-600 hover:bg-primary-50'">
+                        #{{ item.tag }}
+                        <span class="text-[10px] font-bold opacity-60">{{ item.count }}</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Upload Modal -->
+        <div v-if="showUploadModal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
+            <div class="bg-white rounded-[2rem] w-full max-w-md shadow-2xl transform transition-all scale-100 flex flex-col max-h-[90vh] overflow-hidden">
+                <div class="p-6 border-b border-gray-100 flex justify-between items-center bg-gray-50/50 flex-shrink-0">
+                    <h3 class="text-xl font-bold text-gray-800 flex items-center">
+                        <svg class="w-6 h-6 mr-2 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                        上传角色卡
+                    </h3>
+                    <button @click="showUploadModal = false" class="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-200/50 rounded-full transition-all">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+                <div class="p-5 sm:p-6 overflow-y-auto custom-scrollbar flex flex-col h-full">
+                    <div v-if="!uploadingCard"
+                         @click="$refs.fileInput.click()"
+                         class="border-2 border-dashed border-gray-200 rounded-3xl p-8 sm:p-12 text-center hover:border-primary-500 hover:bg-primary-50/50 transition-all cursor-pointer group relative overflow-hidden flex-1 flex flex-col items-center justify-center min-h-[300px]">
+                        <div class="relative z-10">
+                            <div class="w-16 h-16 sm:w-20 sm:h-20 bg-gray-100 rounded-2xl flex items-center justify-center mx-auto mb-4 sm:mb-6 group-hover:bg-primary-100 group-hover:text-primary-600 transition-all transform group-hover:scale-110 group-hover:rotate-3">
+                                <svg class="w-8 h-8 sm:w-10 sm:h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                            </div>
+                            <p class="text-base sm:text-lg font-bold text-gray-700">点击上传角色卡</p>
+                            <p class="text-xs sm:text-sm text-gray-400 mt-2">支持 .png 或 .json 格式</p>
+                        </div>
+                        <input type="file" ref="fileInput" accept=".png,.json" @change="handleFileSelect" class="hidden">
+                    </div>
+
+                    <div v-else class="flex flex-col h-full animate-slide-up">
+                        <!-- Compact Preview -->
+                        <div class="flex flex-col items-center gap-4 p-4 bg-gray-50 rounded-3xl border border-gray-100 shadow-inner mb-4 flex-1 justify-center min-h-0">
+                            <!-- Image -->
+                            <div class="relative w-40 sm:w-48 flex-shrink-0 aspect-[3/4] rounded-2xl overflow-hidden shadow-lg ring-4 ring-white">
+                                <img :src="uploadingCard.avatar" class="w-full h-full object-cover">
+                                <div class="absolute top-2 right-2 bg-green-500 text-white p-1.5 rounded-full shadow-md animate-scale-in">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"></path></svg>
+                                </div>
+                            </div>
+                            
+                            <!-- Info -->
+                            <div class="text-center w-full px-4">
+                                <h4 class="font-bold text-xl text-gray-900 truncate mb-2">{{ uploadingCard.name }}</h4>
+                                <div class="text-sm text-gray-500 flex items-center justify-center bg-white/60 py-1.5 px-3 rounded-xl inline-flex">
+                                    <span class="w-2 h-2 bg-green-400 rounded-full mr-2 animate-pulse"></span>
+                                    解析成功，准备发布
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Actions -->
+                        <div class="flex flex-col gap-2 mt-auto">
+                            <button @click="confirmUpload" :disabled="isUploading" class="w-full bg-primary-600 hover:bg-primary-700 text-white py-3.5 rounded-2xl font-bold transition-all shadow-lg shadow-primary-100 disabled:opacity-50 flex items-center justify-center gap-2 active:scale-[0.98]">
+                                <span v-if="isUploading" class="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent"></span>
+                                {{ isUploading ? '正在发布...' : '确认发布到广场' }}
+                            </button>
+                            <button @click="uploadingCard = null" :disabled="isUploading" class="w-full text-gray-400 text-sm font-bold py-2 hover:text-gray-600 transition-colors">重新选择文件</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Edit Card Modal -->
+        <div v-if="showEditModal && editingCard" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
+            <div class="bg-white rounded-[2rem] w-full max-w-md shadow-2xl transform transition-all flex flex-col max-h-[90vh] overflow-hidden">
+                <div class="p-6 border-b border-gray-100 flex justify-between items-center bg-gray-50/50 flex-shrink-0">
+                    <h3 class="text-xl font-bold text-gray-800 flex items-center">
+                        <svg class="w-6 h-6 mr-2 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                        编辑角色卡
+                    </h3>
+                    <button @click="showEditModal = false" class="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-200/50 rounded-full transition-all">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+                <div class="p-5 sm:p-6 overflow-y-auto custom-scrollbar flex flex-col gap-4">
+                    <!-- Preview -->
+                    <div v-if="editingCard.avatar_url" class="flex justify-center">
+                        <div class="w-24 h-32 rounded-xl overflow-hidden shadow-md ring-2 ring-gray-100">
+                            <img :src="editingCard.avatar_url" class="w-full h-full object-cover" @error="if (!$event.target.dataset.fallback) { $event.target.dataset.fallback = '1'; $event.target.src = defaultAvatar }">
+                        </div>
+                    </div>
+                    <!-- Re-upload file -->
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">重新上传文件（可选）</label>
+                        <label class="flex items-center justify-center w-full px-4 py-3 border-2 border-dashed border-gray-200 rounded-2xl cursor-pointer hover:border-blue-400 hover:bg-blue-50/50 transition-all">
+                            <svg class="w-5 h-5 text-gray-400 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                            <span class="text-sm text-gray-500">选择 .png 或 .json 文件</span>
+                            <input type="file" accept=".png,.json" @change="handleEditFileSelect" class="hidden">
+                        </label>
+                    </div>
+                    <!-- Name -->
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">名称</label>
+                        <input v-model="editingCard.name" type="text" class="w-full px-4 py-2.5 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm">
+                    </div>
+                    <!-- Description -->
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">描述</label>
+                        <textarea v-model="editingCard.description" rows="3" class="w-full px-4 py-2.5 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm resize-none"></textarea>
+                    </div>
+                    <!-- Creator Notes -->
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">创作者备注</label>
+                        <textarea v-model="editingCard.creator_notes" rows="2" class="w-full px-4 py-2.5 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm resize-none"></textarea>
+                    </div>
+                    <!-- Actions -->
+                    <div class="flex flex-col gap-2 mt-2">
+                        <button @click="confirmEditCard" :disabled="isEditUploading" class="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-2xl font-bold transition-all shadow-lg disabled:opacity-50 flex items-center justify-center gap-2">
+                            <span v-if="isEditUploading" class="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent"></span>
+                            {{ isEditUploading ? '保存中...' : '保存修改' }}
+                        </button>
+                        <button @click="showEditModal = false" :disabled="isEditUploading" class="w-full text-gray-400 text-sm font-bold py-2 hover:text-gray-600 transition-colors">取消</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div v-if="previewOpening.active || (selectedCard && previewAsset.loading)" class="fixed inset-0 z-[100] flex flex-col items-center justify-center bg-gray-900/80 backdrop-blur-xl animate-fade-in">
+            <div class="relative mb-8">
+                <div class="w-20 h-20 border-[3px] border-white/10 rounded-full"></div>
+                <div class="w-20 h-20 border-[3px] border-primary-500 border-t-transparent rounded-full animate-spin absolute top-0 left-0"></div>
+            </div>
+            <p class="text-xl font-bold text-white mb-3 tracking-wide">正在准备详情界面</p>
+            <p class="text-sm text-gray-400 max-w-[280px] text-center leading-relaxed">{{ previewAsset.loading ? '资源正在加载，请稍等...' : '正在请求数据，请稍候...' }}</p>
+            <button v-if="selectedCard || previewOpening.active" @click="selectedCard = null; stopPreviewOpening()" class="mt-10 px-8 py-3 text-white/50 hover:text-white bg-white/5 hover:bg-white/10 rounded-full transition-all text-sm font-medium border border-white/5 hover:border-white/20 active:scale-95">
+                取消进入
+            </button>
+        </div>
+
+        <!-- Preview Modal (Full Screen Mobile Scroll & Parallax) -->
+        <div v-if="selectedCard" class="fixed inset-0 z-50 flex md:items-center justify-center bg-black/60 animate-fade-in md:p-4 md:backdrop-blur-sm md:transition-all md:duration-300">
+
+            <!-- Mobile Container (Parallax Scroll) -->
+            <div v-if="!previewAsset.loading" class="md:hidden w-full h-full relative overflow-y-auto scroll-smooth-mobile no-scrollbar animate-detail-slide-up-mobile"
+                 @scroll="handleMobileScroll">
+                
+                <!-- Close Button -->
+                <button @click="selectedCard = null; stopPreviewOpening()" class="fixed top-4 right-4 z-50 bg-black/30 text-white p-2.5 rounded-full backdrop-blur-md border border-white/20 active:scale-95 transition-transform">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+
+                <!-- Fixed Background Image -->
+                <div class="fixed top-0 left-0 w-full h-[80vh] z-0 overflow-hidden bg-gray-900">
+                    <img :src="previewAsset.imageUrl || selectedCard.thumbnail_url || selectedCard.avatar_url || selectedCard.avatar || defaultAvatar"
+                         id="mobile-bg-img"
+                         class="w-full h-full object-cover object-top mobile-bg-img"
+                         style="opacity: 1">
+                    <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/20"></div>
+                </div>
+
+                <!-- Content Layer (Pushes up content) -->
+                <div class="relative z-10 w-full flex flex-col min-h-screen pt-[62vh]">
+                    <div class="flex-1 bg-white rounded-t-[2.5rem] shadow-[0_-10px_40px_rgba(0,0,0,0.2)] px-6 py-4 pb-32 flex flex-col min-h-[80vh]">
+                        
+                        <!-- Pull Bar & Hint -->
+                        <div class="flex flex-col items-center gap-2 mb-6 flex-shrink-0">
+                            <div class="w-12 h-1.5 bg-gray-200 rounded-full"></div>
+                            <div class="flex flex-col items-center animate-bounce text-gray-400 text-[10px] font-medium tracking-wider uppercase opacity-80">
+                                <svg class="w-4 h-4 -mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"></path></svg>
+                                上滑查看详情
+                            </div>
+                        </div>
+
+                        <!-- Title & Meta -->
+                        <div class="mb-8">
+                            <h2 class="text-3xl font-black text-gray-900 tracking-tight leading-tight">{{ selectedCard.name }}</h2>
+                            <div v-if="previewAsset.error" class="mt-4 text-sm rounded-2xl border px-4 py-3 bg-amber-50 text-amber-700 border-amber-200">
+                                {{ previewAsset.error }}
+                            </div>
+                            <div v-if="selectedCard.creator_notes" class="mt-4 p-4 bg-blue-50/50 rounded-2xl border border-blue-100 text-blue-800 text-sm leading-relaxed">
+                                <div class="flex flex-col gap-2">
+                                    <div v-if="selectedCard.clean_notes">{{ selectedCard.clean_notes }}</div>
+                                    <div v-if="selectedCard.tags && selectedCard.tags.length > 0" class="rounded-2xl border border-blue-100/80 bg-white/70 p-3">
+                                        <div class="flex flex-wrap gap-2">
+                                            <span v-for="tag in selectedCard.tags" :key="tag"
+                                                  class="max-w-full break-all px-2 py-1 rounded-lg text-xs font-bold border border-blue-200 bg-blue-50 text-blue-600">
+                                                {{ tag }}
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Content Sections -->
+                        <div class="space-y-10 flex-1">
+                            <section>
+                                <h4 class="text-base font-black text-gray-400 uppercase tracking-[0.2em] mb-6 flex items-center gap-4">
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                    简要描述
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                </h4>
+                                <div class="text-gray-700 prose prose-lg max-w-none leading-[2] tracking-wide break-words" v-html="renderMarkdown(selectedCard.description || '暂无描述')"></div>
+                            </section>
+
+                            <section v-if="selectedCard._display.personality">
+                                <h4 class="text-base font-black text-gray-400 uppercase tracking-[0.2em] mb-6 flex items-center gap-4">
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                    设定
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                </h4>
+                                <div class="text-gray-700 prose prose-lg max-w-none leading-[2] tracking-wide break-words" v-html="renderMarkdown(selectedCard._display.personality)"></div>
+                            </section>
+
+                            <section v-if="selectedCard._display.first_mes">
+                                <h4 class="text-base font-black text-gray-400 uppercase tracking-[0.2em] mb-6 flex items-center gap-4">
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                    开场白
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                </h4>
+                                <!-- Force iframe remounting so each open starts from a clean render state. -->
+                                <div :key="selectedCard.renderId" class="text-gray-700 prose prose-lg max-w-none leading-relaxed tracking-normal break-words" v-html="renderMarkdown(selectedCard._display.first_mes)"></div>
+                            </section>
+
+                            <!-- Comments Section -->
+                            <section>
+                                <h4 class="text-base font-black text-gray-400 uppercase tracking-[0.2em] mb-6 flex items-center gap-4">
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                    评论 ({{ comments.length }})
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                </h4>
+                                
+                                <div class="bg-gray-50 rounded-2xl p-4 mb-6 border border-gray-100">
+                                    <div class="flex flex-col gap-3">
+                                        <div v-if="newComment.reply_to_id" class="flex items-center gap-2 text-xs text-primary-600 bg-primary-50 px-3 py-1.5 rounded-lg">
+                                            <span>回复 <b>{{ newComment.reply_to_name }}</b></span>
+                                            <button @click="cancelReply" class="text-gray-400 hover:text-gray-600 ml-auto">&times;</button>
+                                        </div>
+                                        <textarea v-model="newComment.content" rows="3" :placeholder="newComment.reply_to_id ? '写下你的回复...' : (isLoggedIn ? '写下你的评论（至少5个字）...' : '请先登录后再评论...')" class="bg-white border border-gray-200 rounded-xl px-4 py-3 text-sm focus:border-primary-500 outline-none transition-colors resize-none" :disabled="!isLoggedIn"></textarea>
+                                        <div class="flex items-center justify-between">
+                                            <span v-if="!isLoggedIn" class="text-xs text-gray-400">
+                                                <button @click="showUserAuthModal = true; userAuthMode = 'login'" class="text-primary-600 font-bold hover:underline">登录</button>
+                                                后即可评论
+                                            </span>
+                                            <span v-else class="text-xs text-gray-400">每条评论（≥5字）可获得 2 次下载机会</span>
+                                            <button @click="submitComment" :disabled="!isLoggedIn" class="bg-primary-600 text-white px-6 py-2 rounded-xl text-sm font-bold shadow-md shadow-primary-200 active:scale-95 transition-all disabled:opacity-50">发布</button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Hot Comment -->
+                                <div v-if="loadingComments" class="flex justify-center py-4">
+                                    <div class="animate-spin rounded-full h-6 w-6 border-2 border-primary-500 border-t-transparent"></div>
+                                </div>
+                                <div v-else-if="comments.length === 0" class="text-center py-8 text-gray-400 text-sm">
+                                    暂无评论，快来抢沙发吧~
+                                </div>
+                                <div v-else class="space-y-4">
+                                    <div v-for="root in commentTree" :key="root.id" class="bg-gray-50 rounded-2xl p-4 border border-gray-100" :class="{ 'ring-1 ring-orange-200': root.is_hot }">
+                                        <div class="flex justify-between items-start mb-1">
+                                            <div class="flex items-center gap-2 flex-wrap">
+                                                <span class="text-xs font-bold text-primary-600">{{ root.author_name || root.nickname }}</span>
+                                                <span v-if="root.user_id && selectedCard && root.user_id === selectedCard.uploader_user_id" class="text-[10px] font-bold text-white bg-primary-500 px-1.5 py-0.5 rounded-md">作者</span>
+                                                <span class="text-[10px] text-gray-400">{{ formatDate(root.created_at) }}</span>
+                                                <span v-if="root.is_hot" class="text-[10px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded-md border border-orange-100">🔥热门</span>
+                                            </div>
+                                            <button v-if="isAdmin" @click="deleteComment(root.id)" class="text-xs text-red-400 hover:text-red-600">删除</button>
+                                        </div>
+                                        <p class="text-gray-600 text-sm leading-relaxed whitespace-pre-wrap mt-1">{{ root.content }}</p>
+                                        <div class="flex items-center gap-3 mt-2">
+                                            <button @click="likeComment(root)" class="flex items-center gap-1 text-xs transition-all active:scale-95" :class="root.user_liked ? 'text-pink-500' : 'text-gray-400 hover:text-pink-400'">
+                                                <svg class="w-4 h-4" :fill="root.user_liked ? 'currentColor' : 'none'" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
+                                                {{ root.likes_count || 0 }}
+                                            </button>
+                                            <button @click="replyToComment(root)" class="flex items-center gap-1 text-xs text-gray-400 hover:text-primary-500 transition-all active:scale-95">
+                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"></path></svg>
+                                                回复
+                                            </button>
+                                        </div>
+                                        <!-- Nested replies -->
+                                        <div v-if="root.replies.length > 0" class="mt-3 border-t border-gray-100 pt-3">
+                                            <div class="space-y-2 pl-3 border-l-2 border-primary-100">
+                                                <div v-for="reply in (expandedComments.has(root.id) ? root.replies : root.replies.slice(0, 2))" :key="reply.id" class="bg-white rounded-xl p-3 border border-gray-50">
+                                                    <div class="flex justify-between items-start mb-1">
+                                                        <div class="flex items-center gap-1.5 flex-wrap">
+                                                            <span class="text-xs font-bold text-primary-600">{{ reply.author_name || reply.nickname }}</span>
+                                                            <span v-if="reply.user_id && selectedCard && reply.user_id === selectedCard.uploader_user_id" class="text-[10px] font-bold text-white bg-primary-500 px-1.5 py-0.5 rounded-md">作者</span>
+                                                            <span v-if="reply.reply_to_name" class="text-[10px] text-gray-400">回复 <span class="font-bold text-primary-500">{{ reply.reply_to_name }}</span></span>
+                                                            <span class="text-[10px] text-gray-400">{{ formatDate(reply.created_at) }}</span>
+                                                            <span v-if="reply.is_hot" class="text-[10px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded-md border border-orange-100">🔥热门</span>
+                                                        </div>
+                                                        <button v-if="isAdmin" @click="deleteComment(reply.id)" class="text-xs text-red-400 hover:text-red-600">删除</button>
+                                                    </div>
+                                                    <p class="text-gray-600 text-sm leading-relaxed whitespace-pre-wrap mt-1">{{ reply.content }}</p>
+                                                    <div class="flex items-center gap-3 mt-1.5">
+                                                        <button @click="likeComment(reply)" class="flex items-center gap-1 text-xs transition-all active:scale-95" :class="reply.user_liked ? 'text-pink-500' : 'text-gray-400 hover:text-pink-400'">
+                                                            <svg class="w-3.5 h-3.5" :fill="reply.user_liked ? 'currentColor' : 'none'" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
+                                                            {{ reply.likes_count || 0 }}
+                                                        </button>
+                                                        <button @click="replyToComment(reply)" class="flex items-center gap-1 text-xs text-gray-400 hover:text-primary-500 transition-all active:scale-95">
+                                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"></path></svg>
+                                                            回复
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <button v-if="root.replies.length > 2" @click="toggleReplies(root.id)" class="text-xs text-primary-500 font-bold mt-2 flex items-center gap-1 hover:text-primary-600 transition-colors pl-3">
+                                                <svg class="w-3 h-3 transition-transform" :class="expandedComments.has(root.id) ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                                {{ expandedComments.has(root.id) ? '收起回复' : '展开更多 ' + (root.replies.length - 2) + ' 条回复' }}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </section>
+                        </div>
+
+                    </div>
+                </div>
+
+                <!-- Fixed Footer Actions (Mobile) -->
+                <div class="fixed bottom-0 left-0 w-full p-4 bg-white/90 backdrop-blur-md border-t border-gray-100 z-50 flex gap-3 safe-area-pb">
+                     <button @click="downloadCard(selectedCard)" :disabled="!canDownloadSelectedCard"
+                             class="flex-1 py-3.5 rounded-2xl font-bold shadow-lg flex items-center justify-center gap-2 transition-all"
+                             :class="canDownloadSelectedCard ? 'bg-gray-900 hover:bg-black text-white active:scale-[0.98]' : 'bg-gray-200 text-gray-500 cursor-not-allowed'">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                        {{ downloadButtonLabel }}
+                    </button>
+                    <button v-if="(isLoggedIn && currentUser && selectedCard.uploader_user_id === currentUser.id) || isAdmin" @click="deleteCard(selectedCard); selectedCard = null" class="w-14 bg-red-50 text-red-500 rounded-2xl flex items-center justify-center">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Desktop Container (Unchanged) -->
+            <div v-if="!previewAsset.loading" class="hidden md:flex bg-white w-full h-auto max-h-[90vh] max-w-6xl rounded-[2.5rem] flex-row shadow-2xl overflow-hidden animate-detail-scale-in relative">
+                
+                <!-- Left: Image Section -->
+                <div class="relative w-2/5 h-auto flex-shrink-0 bg-gray-100">
+                    <img :src="previewAsset.imageUrl || selectedCard.thumbnail_url || selectedCard.avatar_url || selectedCard.avatar || defaultAvatar" class="absolute inset-0 w-full h-full object-cover object-top transition-opacity duration-300" style="opacity: 1">
+                </div>
+
+                <!-- Right: Content Section -->
+                <div class="flex-1 flex flex-col min-h-0 bg-white p-10 lg:p-12">
+                    
+                    <!-- Close Button -->
+                    <button @click="selectedCard = null; stopPreviewOpening()" class="absolute top-8 right-8 p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-full transition-all z-20">
+                        <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+
+                    <!-- Scrollable Content -->
+                    <div class="flex-1 overflow-y-auto custom-scrollbar pr-4">
+                        
+                        <!-- Title & Meta -->
+                        <div class="mb-8">
+                            <h2 class="text-3xl md:text-4xl font-black text-gray-900 tracking-tight leading-tight">{{ selectedCard.name }}</h2>
+                            <div v-if="previewAsset.error" class="mt-4 text-sm rounded-2xl border px-4 py-3 bg-amber-50 text-amber-700 border-amber-200">
+                                {{ previewAsset.error }}
+                            </div>
+                            
+                            <!-- Creator Notes Content (Visible in Preview) -->
+                            <div v-if="selectedCard.creator_notes" class="mt-4 p-4 bg-blue-50/50 rounded-2xl border border-blue-100 text-blue-800 text-sm leading-relaxed">
+                                <div class="flex flex-col gap-2">
+                                    <div v-if="selectedCard.clean_notes">{{ selectedCard.clean_notes }}</div>
+                                    <div v-if="selectedCard.tags && selectedCard.tags.length > 0" class="flex flex-wrap gap-2">
+                                        <span v-for="tag in selectedCard.tags" :key="tag"
+                                              class="px-2 py-1 rounded-lg text-xs font-bold border border-blue-200 bg-blue-50 text-blue-600">
+                                            {{ tag }}
+                                        </span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Content Sections -->
+                        <div class="space-y-10 pb-4">
+                            <section>
+                                <h4 class="text-base font-black text-gray-400 uppercase tracking-[0.2em] mb-6 flex items-center gap-4">
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                    简要描述
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                </h4>
+                                <div class="text-gray-700 prose prose-lg max-w-none leading-[2] tracking-wide break-words" v-html="renderMarkdown(selectedCard.description || '暂无描述')"></div>
+                            </section>
+
+                            <section v-if="selectedCard._display.personality">
+                                <h4 class="text-base font-black text-gray-400 uppercase tracking-[0.2em] mb-6 flex items-center gap-4">
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                    设定
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                </h4>
+                                <div class="text-gray-700 prose prose-lg max-w-none leading-[2] tracking-wide break-words" v-html="renderMarkdown(selectedCard._display.personality)"></div>
+                            </section>
+
+                            <section v-if="selectedCard._display.first_mes">
+                                <h4 class="text-base font-black text-gray-400 uppercase tracking-[0.2em] mb-6 flex items-center gap-4">
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                    开场白
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                </h4>
+                                <!-- Force iframe remounting so each open starts from a clean render state. -->
+                                <div :key="selectedCard.renderId" class="text-gray-700 prose prose-lg max-w-none leading-relaxed tracking-normal break-words" v-html="renderMarkdown(selectedCard._display.first_mes)"></div>
+                            </section>
+
+                            <!-- Comments Section -->
+                            <section>
+                                <h4 class="text-base font-black text-gray-400 uppercase tracking-[0.2em] mb-6 flex items-center gap-4">
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                    评论 ({{ comments.length }})
+                                    <span class="w-8 h-0.5 bg-primary-200 rounded-full"></span>
+                                </h4>
+                                
+                                <div class="bg-gray-50 rounded-2xl p-4 mb-6 border border-gray-100">
+                                    <div class="flex flex-col gap-3">
+                                        <div v-if="newComment.reply_to_id" class="flex items-center gap-2 text-xs text-primary-600 bg-primary-50 px-3 py-1.5 rounded-lg">
+                                            <span>回复 <b>{{ newComment.reply_to_name }}</b></span>
+                                            <button @click="cancelReply" class="text-gray-400 hover:text-gray-600 ml-auto">&times;</button>
+                                        </div>
+                                        <textarea v-model="newComment.content" rows="3" :placeholder="newComment.reply_to_id ? '写下你的回复...' : (isLoggedIn ? '写下你的评论（至少5个字）...' : '请先登录后再评论...')" class="bg-white border border-gray-200 rounded-xl px-4 py-3 text-sm focus:border-primary-500 outline-none transition-colors resize-none" :disabled="!isLoggedIn"></textarea>
+                                        <div class="flex items-center justify-between">
+                                            <span v-if="!isLoggedIn" class="text-xs text-gray-400">
+                                                <button @click="showUserAuthModal = true; userAuthMode = 'login'" class="text-primary-600 font-bold hover:underline">登录</button>
+                                                后即可评论
+                                            </span>
+                                            <span v-else class="text-xs text-gray-400">每条评论（≥5字）可获得 2 次下载机会</span>
+                                            <button @click="submitComment" :disabled="!isLoggedIn" class="bg-primary-600 text-white px-6 py-2 rounded-xl text-sm font-bold shadow-md shadow-primary-200 active:scale-95 transition-all disabled:opacity-50">发布</button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Hot Comment -->
+                                <div v-if="loadingComments" class="flex justify-center py-4">
+                                    <div class="animate-spin rounded-full h-6 w-6 border-2 border-primary-500 border-t-transparent"></div>
+                                </div>
+                                <div v-else-if="comments.length === 0" class="text-center py-8 text-gray-400 text-sm">
+                                    暂无评论，快来抢沙发吧~
+                                </div>
+                                <div v-else class="space-y-4">
+                                    <div v-for="root in commentTree" :key="'dt-' + root.id" class="bg-gray-50 rounded-2xl p-4 border border-gray-100" :class="{ 'ring-1 ring-orange-200': root.is_hot }">
+                                        <div class="flex justify-between items-start mb-1">
+                                            <div class="flex items-center gap-2 flex-wrap">
+                                                <span class="text-xs font-bold text-primary-600">{{ root.author_name || root.nickname }}</span>
+                                                <span v-if="root.user_id && selectedCard && root.user_id === selectedCard.uploader_user_id" class="text-[10px] font-bold text-white bg-primary-500 px-1.5 py-0.5 rounded-md">作者</span>
+                                                <span class="text-[10px] text-gray-400">{{ formatDate(root.created_at) }}</span>
+                                                <span v-if="root.is_hot" class="text-[10px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded-md border border-orange-100">🔥热门</span>
+                                            </div>
+                                            <button v-if="isAdmin" @click="deleteComment(root.id)" class="text-xs text-red-400 hover:text-red-600">删除</button>
+                                        </div>
+                                        <p class="text-gray-600 text-sm leading-relaxed whitespace-pre-wrap mt-1">{{ root.content }}</p>
+                                        <div class="flex items-center gap-3 mt-2">
+                                            <button @click="likeComment(root)" class="flex items-center gap-1 text-xs transition-all active:scale-95" :class="root.user_liked ? 'text-pink-500' : 'text-gray-400 hover:text-pink-400'">
+                                                <svg class="w-4 h-4" :fill="root.user_liked ? 'currentColor' : 'none'" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
+                                                {{ root.likes_count || 0 }}
+                                            </button>
+                                            <button @click="replyToComment(root)" class="flex items-center gap-1 text-xs text-gray-400 hover:text-primary-500 transition-all active:scale-95">
+                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"></path></svg>
+                                                回复
+                                            </button>
+                                        </div>
+                                        <!-- Nested replies -->
+                                        <div v-if="root.replies.length > 0" class="mt-3 border-t border-gray-100 pt-3">
+                                            <div class="space-y-2 pl-3 border-l-2 border-primary-100">
+                                                <div v-for="reply in (expandedComments.has(root.id) ? root.replies : root.replies.slice(0, 2))" :key="'dt-r-' + reply.id" class="bg-white rounded-xl p-3 border border-gray-50">
+                                                    <div class="flex justify-between items-start mb-1">
+                                                        <div class="flex items-center gap-1.5 flex-wrap">
+                                                            <span class="text-xs font-bold text-primary-600">{{ reply.author_name || reply.nickname }}</span>
+                                                            <span v-if="reply.user_id && selectedCard && reply.user_id === selectedCard.uploader_user_id" class="text-[10px] font-bold text-white bg-primary-500 px-1.5 py-0.5 rounded-md">作者</span>
+                                                            <span v-if="reply.reply_to_name" class="text-[10px] text-gray-400">回复 <span class="font-bold text-primary-500">{{ reply.reply_to_name }}</span></span>
+                                                            <span class="text-[10px] text-gray-400">{{ formatDate(reply.created_at) }}</span>
+                                                            <span v-if="reply.is_hot" class="text-[10px] font-bold text-orange-500 bg-orange-50 px-1.5 py-0.5 rounded-md border border-orange-100">🔥热门</span>
+                                                        </div>
+                                                        <button v-if="isAdmin" @click="deleteComment(reply.id)" class="text-xs text-red-400 hover:text-red-600">删除</button>
+                                                    </div>
+                                                    <p class="text-gray-600 text-sm leading-relaxed whitespace-pre-wrap mt-1">{{ reply.content }}</p>
+                                                    <div class="flex items-center gap-3 mt-1.5">
+                                                        <button @click="likeComment(reply)" class="flex items-center gap-1 text-xs transition-all active:scale-95" :class="reply.user_liked ? 'text-pink-500' : 'text-gray-400 hover:text-pink-400'">
+                                                            <svg class="w-3.5 h-3.5" :fill="reply.user_liked ? 'currentColor' : 'none'" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
+                                                            {{ reply.likes_count || 0 }}
+                                                        </button>
+                                                        <button @click="replyToComment(reply)" class="flex items-center gap-1 text-xs text-gray-400 hover:text-primary-500 transition-all active:scale-95">
+                                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"></path></svg>
+                                                            回复
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <button v-if="root.replies.length > 2" @click="toggleReplies(root.id)" class="text-xs text-primary-500 font-bold mt-2 flex items-center gap-1 hover:text-primary-600 transition-colors pl-3">
+                                                <svg class="w-3 h-3 transition-transform" :class="expandedComments.has(root.id) ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                                {{ expandedComments.has(root.id) ? '收起回复' : '展开更多 ' + (root.replies.length - 2) + ' 条回复' }}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </section>
+                        </div>
+                    </div>
+
+                    <!-- Footer Actions -->
+                    <div class="pt-6 mt-4 border-t border-gray-100 md:pt-8 md:mt-0 flex gap-4 p-6 md:p-0 bg-white md:static sticky bottom-0 z-20 shadow-[0_-4px_20px_rgba(0,0,0,0.05)] md:shadow-none pb-8 md:pb-0 safe-area-pb flex-shrink-0">
+                        <button @click="downloadCard(selectedCard)" :disabled="!canDownloadSelectedCard"
+                                class="flex-1 py-4 md:py-5 rounded-2xl font-bold transition-all shadow-xl flex items-center justify-center gap-3 group"
+                                :class="canDownloadSelectedCard ? 'bg-gray-900 hover:bg-black text-white shadow-gray-200 active:scale-[0.98]' : 'bg-gray-200 text-gray-500 shadow-transparent cursor-not-allowed'">
+                            <svg class="w-5 h-5 md:w-6 md:h-6 transform transition-transform group-hover:translate-y-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                            {{ downloadButtonLabel }}
+                        </button>
+                        <button v-if="(isLoggedIn && currentUser && selectedCard.uploader_user_id === currentUser.id) || isAdmin" @click="deleteCard(selectedCard); selectedCard = null" class="w-14 bg-red-50 hover:bg-red-100 text-red-500 rounded-2xl flex items-center justify-center transition-colors">
+                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Admin Login Modal -->
+        <div v-if="showAdminLogin" class="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-[100]" @click.self="showAdminLogin = false">
+            <div class="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm mx-4 animate-scale-in">
+                <h3 class="text-lg font-bold text-gray-900 mb-4 text-center">管理员登录</h3>
+                <form @submit.prevent="handleAdminLogin" class="space-y-3">
+                    <input v-model="adminLoginForm.username" type="text" placeholder="用户名" autocomplete="username"
+                        class="w-full px-4 py-2.5 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm">
+                    <input v-model="adminLoginForm.password" type="password" placeholder="密码" autocomplete="current-password"
+                        class="w-full px-4 py-2.5 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm">
+                    <div v-if="adminLoginError" class="text-red-500 text-xs bg-red-50 p-2 rounded-lg">{{ adminLoginError }}</div>
+                    <div class="flex gap-2">
+                        <button type="button" @click="showAdminLogin = false" class="flex-1 py-2.5 border border-gray-200 rounded-xl text-sm text-gray-600 hover:bg-gray-50">取消</button>
+                        <button type="submit" class="flex-1 py-2.5 bg-blue-600 text-white rounded-xl text-sm font-medium hover:bg-blue-700">登录</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- User Auth Modal (Login/Register) -->
+        <div v-if="showUserAuthModal" class="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-[100]" @mousedown.self="showUserAuthModal = false">
+            <div class="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm mx-4 animate-scale-in">
+                <h3 class="text-lg font-bold text-gray-900 mb-1 text-center">{{ userAuthMode === 'register' ? '注册账号' : '登录' }}</h3>
+                <p class="text-xs text-gray-400 text-center mb-4">{{ userAuthMode === 'register' ? '注册即送 1 次下载机会' : '登录后评论和点赞可获取下载次数' }}</p>
+                <form @submit.prevent="handleUserAuth" class="space-y-3">
+                    <input v-model="userAuthForm.username" type="text" placeholder="用户名（2-20个字符）" autocomplete="username"
+                        class="w-full px-4 py-2.5 border border-gray-200 rounded-xl focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none text-sm">
+                    <input v-model="userAuthForm.password" type="password" :placeholder="userAuthMode === 'register' ? '密码（至少6位）' : '密码'" autocomplete="current-password"
+                        class="w-full px-4 py-2.5 border border-gray-200 rounded-xl focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none text-sm">
+                    <div v-if="userAuthError" class="text-red-500 text-xs bg-red-50 p-2 rounded-lg">{{ userAuthError }}</div>
+                    <button type="submit" class="w-full py-2.5 bg-primary-600 text-white rounded-xl text-sm font-bold hover:bg-primary-700 transition-colors">
+                        {{ userAuthMode === 'register' ? '注册' : '登录' }}
+                    </button>
+                    <div class="text-center text-xs text-gray-400">
+                        <span v-if="userAuthMode === 'login'">
+                            没有账号？
+                            <button type="button" @click="userAuthMode = 'register'; userAuthError = ''" class="text-primary-600 font-bold hover:underline">立即注册</button>
+                        </span>
+                        <span v-else>
+                            已有账号？
+                            <button type="button" @click="userAuthMode = 'login'; userAuthError = ''" class="text-primary-600 font-bold hover:underline">去登录</button>
+                        </span>
+                    </div>
+                    <div class="text-center">
+                        <button type="button" @click="showUserAuthModal = false" class="text-xs text-gray-400 hover:text-gray-600">取消</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        const { createApp, ref, computed, onMounted, onUnmounted, reactive, watch } = Vue;
+
+        // API Configuration (local backend)
+        const API_BASE = '';  // Same origin
+
+        // Safe localStorage wrapper (handles Tracking Prevention blocking)
+        const safeStorage = {
+            getItem(key) { try { return localStorage.getItem(key); } catch(e) { return null; } },
+            setItem(key, val) { try { localStorage.setItem(key, val); } catch(e) {} },
+            removeItem(key) { try { localStorage.removeItem(key); } catch(e) {} }
+        };
+
+        createApp({
+            setup() {
+                const defaultAvatar = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIj48cmVjdCB3aWR0aD0iMTAwIiBoZWlnaHQ9IjEwMCIgZmlsbD0iI2U1ZTdlYiIvPjwvc3ZnPg==';
+                
+                const cards = ref([]);
+                const cardSort = ref('latest');
+                const showSortDropdown = ref(false);
+                const loading = ref(true);
+                const searchQuery = ref('');
+                const currentTab = ref('all');
+                const myUploadedIds = ref(JSON.parse(safeStorage.getItem('my_uploaded_ids') || '[]'));
+                const configuredPopularTags = ref([]);
+                const configuredTagLibrary = ref([]);
+                const hiddenPopularTags = ref([]);
+                const hiddenTagLibrary = ref([]);
+                const downloadCredits = computed(() => currentUser.value ? currentUser.value.download_credits : parseInt(safeStorage.getItem('download_credits') || '0'));
+                const showUploadModal = ref(false);
+                const showSearchModal = ref(false);
+                const uploadingCard = ref(null);
+                const isUploading = ref(false);
+                const selectedCard = ref(null);
+                const previewOpening = reactive({
+                    active: false,
+                    name: '',
+                    imageUrl: ''
+                });
+                const previewAsset = reactive({
+                    cardId: '',
+                    loading: false,
+                    ready: false,
+                    error: '',
+                    imageUrl: '',
+                    source: 'original',
+                    shouldRevoke: false
+                });
+                const isDownloadingCard = ref(false);
+                const toasts = ref([]);
+                const windowWidth = ref(window.innerWidth);
+                let previewOpenRequestId = 0;
+                let mobileScrollTicking = false;
+                const PREVIEW_OPENING_MIN_MS = 500;
+
+                const handleMobileScroll = (e) => {
+                    if (mobileScrollTicking) return;
+                    mobileScrollTicking = true;
+                    const container = e.target;
+                    requestAnimationFrame(() => {
+                        const scrollTop = container.scrollTop;
+                        const blur = Math.min(6, scrollTop / 70);
+                        const scale = 1 + blur / 180;
+                        const bgImage = document.getElementById('mobile-bg-img');
+                        if (bgImage) {
+                            bgImage.style.filter = blur > 0 ? `blur(${blur}px)` : 'none';
+                            bgImage.style.transform = `scale(${scale}) translateZ(0)`;
+                        }
+                        mobileScrollTicking = false;
+                    });
+                };
+
+                const handleWindowResize = () => {
+                    windowWidth.value = window.innerWidth;
+                };
+
+                const handleWindowFocus = () => {
+                    loadPublicSettings();
+                };
+
+                const handleVisibilityChange = () => {
+                    if (!document.hidden) {
+                        loadPublicSettings();
+                    }
+                };
+
+                // Comments Logic
+                const comments = ref([]);
+                const loadingComments = ref(false);
+                const newComment = reactive({
+                    content: '',
+                    reply_to_id: null,
+                    reply_to_name: ''
+                });
+                const expandedComments = ref(new Set());
+
+                const commentTree = computed(() => {
+                    const all = comments.value;
+                    const byId = {};
+                    all.forEach(c => byId[c.id] = c);
+                    // Find root ancestor of a comment
+                    function findRoot(c, visited) {
+                        if (!c.reply_to_id) return c.id;
+                        if (visited.has(c.id)) return c.id;
+                        visited.add(c.id);
+                        const parent = byId[c.reply_to_id];
+                        if (!parent) return c.id;
+                        return findRoot(parent, visited);
+                    }
+                    const roots = [];
+                    const repliesMap = {};
+                    all.forEach(c => {
+                        if (!c.reply_to_id) {
+                            roots.push(c);
+                            if (!repliesMap[c.id]) repliesMap[c.id] = [];
+                        } else {
+                            const rootId = findRoot(c, new Set());
+                            if (!repliesMap[rootId]) repliesMap[rootId] = [];
+                            repliesMap[rootId].push(c);
+                        }
+                    });
+                    return roots.map(r => ({
+                        ...r,
+                        replies: repliesMap[r.id] || []
+                    }));
+                });
+
+                const toggleReplies = (commentId) => {
+                    const s = new Set(expandedComments.value);
+                    if (s.has(commentId)) s.delete(commentId);
+                    else s.add(commentId);
+                    expandedComments.value = s;
+                };
+
+                // Admin Logic - JWT-based authentication
+                const isAdmin = ref(false);
+                const adminToken = ref(safeStorage.getItem('admin_token') || '');
+                const adminClickCount = ref(0);
+                const lastClickTime = ref(0);
+                const showAdminLogin = ref(false);
+                const adminLoginForm = reactive({ username: '', password: '' });
+                const adminLoginError = ref('');
+
+                // User Auth (regular users, separate from admin)
+                const userToken = ref(safeStorage.getItem('user_token') || '');
+                const currentUser = ref(null);
+                const isLoggedIn = computed(() => !!currentUser.value);
+                const showUserAuthModal = ref(false);
+                const userAuthMode = ref('login'); // 'login' or 'register'
+                const userAuthForm = reactive({ username: '', password: '' });
+                const userAuthError = ref('');
+
+                // Check existing token on load
+                const checkAdminToken = async () => {
+                    if (!adminToken.value) return;
+                    try {
+                        const resp = await fetch(API_BASE + '/api/auth/me', {
+                            headers: { 'Authorization': 'Bearer ' + adminToken.value }
+                        });
+                        if (resp.ok) {
+                            isAdmin.value = true;
+                        } else {
+                            adminToken.value = '';
+                            safeStorage.removeItem('admin_token');
+                        }
+                    } catch (e) {
+                        adminToken.value = '';
+                        safeStorage.removeItem('admin_token');
+                    }
+                };
+
+                const adminAuthHeaders = () => ({
+                    'Authorization': 'Bearer ' + adminToken.value,
+                    'Content-Type': 'application/json'
+                });
+
+                const handleAdminLogin = async () => {
+                    adminLoginError.value = '';
+                    try {
+                        const resp = await fetch(API_BASE + '/api/auth/login', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ username: adminLoginForm.username, password: adminLoginForm.password })
+                        });
+                        const data = await resp.json();
+                        if (!resp.ok) {
+                            adminLoginError.value = data.error || '登录失败';
+                            return;
+                        }
+                        adminToken.value = data.token;
+                        safeStorage.setItem('admin_token', data.token);
+                        isAdmin.value = true;
+                        showAdminLogin.value = false;
+                        adminLoginForm.username = '';
+                        adminLoginForm.password = '';
+                        showToast('已进入管理员模式', 'success');
+                    } catch (e) {
+                        adminLoginError.value = '网络错误';
+                    }
+                };
+
+                const handleAdminLogout = () => {
+                    adminToken.value = '';
+                    isAdmin.value = false;
+                    safeStorage.removeItem('admin_token');
+                    showToast('已退出管理员模式', 'info');
+                };
+
+                const handleLogoClick = () => {
+                    showTagLibrary.value = true;
+                };
+
+                // User Auth Functions
+                const checkUserToken = async () => {
+                    if (!userToken.value) return;
+                    try {
+                        const resp = await fetch(API_BASE + '/api/user/me', {
+                            headers: { 'Authorization': 'Bearer ' + userToken.value }
+                        });
+                        if (resp.ok) {
+                            const data = await resp.json();
+                            currentUser.value = data.user;
+                        } else {
+                            userToken.value = '';
+                            currentUser.value = null;
+                            safeStorage.removeItem('user_token');
+                        }
+                    } catch (e) {
+                        userToken.value = '';
+                        currentUser.value = null;
+                        safeStorage.removeItem('user_token');
+                    }
+                };
+
+                const userAuthHeaders = () => ({
+                    'Authorization': 'Bearer ' + userToken.value,
+                    'Content-Type': 'application/json'
+                });
+
+                const handleUserAuth = async () => {
+                    userAuthError.value = '';
+                    const url = userAuthMode.value === 'register' ? '/api/user/register' : '/api/user/login';
+                    try {
+                        const resp = await fetch(API_BASE + url, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ username: userAuthForm.username, password: userAuthForm.password })
+                        });
+                        const data = await resp.json();
+                        if (!resp.ok) {
+                            userAuthError.value = data.error || '操作失败';
+                            return;
+                        }
+                        userToken.value = data.token;
+                        currentUser.value = data.user;
+                        safeStorage.setItem('user_token', data.token);
+                        showUserAuthModal.value = false;
+                        userAuthForm.username = '';
+                        userAuthForm.password = '';
+                        if (userAuthMode.value === 'register') {
+                            showToast('注册成功！赠送 1 次下载机会', 'success');
+                        } else {
+                            showToast('登录成功', 'success');
+                        }
+                    } catch (e) {
+                        userAuthError.value = '网络错误';
+                    }
+                };
+
+                const handleUserLogout = () => {
+                    userToken.value = '';
+                    currentUser.value = null;
+                    safeStorage.removeItem('user_token');
+                    showToast('已退出登录', 'info');
+                };
+
+                const refreshUserCredits = async () => {
+                    if (!userToken.value) return;
+                    try {
+                        const resp = await fetch(API_BASE + '/api/user/me', {
+                            headers: { 'Authorization': 'Bearer ' + userToken.value }
+                        });
+                        if (resp.ok) {
+                            const data = await resp.json();
+                            currentUser.value = { ...currentUser.value, ...data.user };
+                        }
+                    } catch (e) { /* ignore */ }
+                };
+
+                const saveMyCardId = (id) => {
+                    if (!myUploadedIds.value.includes(id)) {
+                        myUploadedIds.value.push(id);
+                        safeStorage.setItem('my_uploaded_ids', JSON.stringify(myUploadedIds.value));
+                    }
+                };
+
+                const updateLocalCredits = (amount) => {
+                    // For non-logged-in users, fallback to localStorage
+                    const cur = parseInt(safeStorage.getItem('download_credits') || '0');
+                    safeStorage.setItem('download_credits', Math.max(0, cur + amount).toString());
+                };
+
+                const parseTagSetting = (value) => {
+                    if (!value) return [];
+                    if (Array.isArray(value)) {
+                        return [...new Set(value.map(item => String(item).trim()).filter(Boolean))];
+                    }
+                    const raw = String(value).trim();
+                    if (!raw) return [];
+                    try {
+                        const parsed = JSON.parse(raw);
+                        if (Array.isArray(parsed)) {
+                            return [...new Set(parsed.map(item => String(item).trim()).filter(Boolean))];
+                        }
+                    } catch (e) { /* ignore non-JSON input */ }
+                    return [...new Set(raw.split(/[\n,，]/).map(item => item.trim()).filter(Boolean))];
+                };
+
+                const applyPublicSettings = (settings) => {
+                    configuredPopularTags.value = parseTagSetting(settings.popular_tags);
+                    configuredTagLibrary.value = parseTagSetting(settings.tag_library);
+                    hiddenPopularTags.value = parseTagSetting(settings.hidden_popular_tags);
+                    hiddenTagLibrary.value = parseTagSetting(settings.hidden_tag_library);
+                };
+
+                const loadPublicSettings = async () => {
+                    try {
+                        const resp = await fetch(API_BASE + '/api/settings');
+                        if (!resp.ok) return;
+                        const data = await resp.json();
+                        applyPublicSettings(data || {});
+                    } catch (err) {
+                        console.error('Load public settings error:', err);
+                    }
+                };
+
+                const isCardOwnedByCurrentUser = (card) => {
+                    if (!card) return false;
+                    if (isLoggedIn.value && currentUser.value && card.uploader_user_id === currentUser.value.id) {
+                        return true;
+                    }
+                    return myUploadedIds.value.includes(card.id);
+                };
+
+                const popularTags = computed(() => {
+                    const hiddenSet = new Set(hiddenPopularTags.value);
+                    if (configuredPopularTags.value.length > 0) {
+                        return configuredPopularTags.value.filter(tag => !hiddenSet.has(tag));
+                    }
+                    const tagCounts = {};
+                    cards.value.forEach(card => {
+                        if (card.tags && Array.isArray(card.tags)) {
+                            card.tags.forEach(tag => {
+                                if (tag) tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+                            });
+                        }
+                    });
+                    // Rank fallback popular tags by occurrence count and keep the top 20.
+                    return Object.entries(tagCounts)
+                        .filter(([tag]) => !hiddenSet.has(tag))
+                        .sort((a, b) => b[1] - a[1])
+                        .slice(0, 20)
+                        .map(entry => entry[0]);
+                });
+
+                const collapsedPopularTagCount = computed(() => {
+                    if (windowWidth.value < 640) return 3;
+                    if (windowWidth.value < 1024) return 5;
+                    return 8;
+                });
+
+                const visiblePopularTags = computed(() => {
+                    return tagsExpanded.value
+                        ? popularTags.value
+                        : popularTags.value.slice(0, collapsedPopularTagCount.value);
+                });
+
+                const showPopularTagsToggle = computed(() => {
+                    return popularTags.value.length > collapsedPopularTagCount.value;
+                });
+
+                const modalPopularTags = computed(() => {
+                    return popularTags.value;
+                });
+
+                const allTags = computed(() => {
+                    const hiddenSet = new Set(hiddenTagLibrary.value);
+                    const tagCounts = {};
+                    cards.value.forEach(card => {
+                        if (card.tags && Array.isArray(card.tags)) {
+                            card.tags.forEach(tag => {
+                                if (tag) tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+                            });
+                        }
+                    });
+                    const ranked = Object.entries(tagCounts)
+                        .filter(([tag]) => !hiddenSet.has(tag))
+                        .sort((a, b) => b[1] - a[1]);
+                    if (configuredTagLibrary.value.length === 0) {
+                        return ranked.map(([tag, count]) => ({ tag, count }));
+                    }
+                    const visibleConfiguredTags = configuredTagLibrary.value.filter(tag => !hiddenSet.has(tag));
+                    const configuredSet = new Set(visibleConfiguredTags);
+                    return [
+                        ...visibleConfiguredTags.map(tag => ({ tag, count: tagCounts[tag] || 0 })),
+                        ...ranked.filter(([tag]) => !configuredSet.has(tag)).map(([tag, count]) => ({ tag, count }))
+                    ];
+                });
+
+                const searchTag = (tag) => {
+                    if (searchQuery.value === tag) {
+                        searchQuery.value = '';
+                    } else {
+                        searchQuery.value = tag;
+                    }
+                };
+
+                const filteredCards = computed(() => {
+                    let result = [...cards.value];
+
+                    // Tab filter
+                    if (currentTab.value === 'mine') {
+                        result = result.filter(c => isCardOwnedByCurrentUser(c));
+                    }
+
+                    if (searchQuery.value) {
+                        const q = searchQuery.value.toLowerCase();
+                        // Strip a leading hash prefix before matching against tag text.
+                        const tagQ = q.startsWith('#') ? q.slice(1) : q;
+                        result = result.filter(c =>
+                            c.name.toLowerCase().includes(q) ||
+                            (c.description && c.description.toLowerCase().includes(q)) ||
+                            (c.tags && c.tags.some(t => t.toLowerCase().includes(tagQ)))
+                        );
+                    }
+
+                    // Sorting
+                    if (cardSort.value === 'hot') {
+                        result.sort((a, b) => (b.likes_count || 0) - (a.likes_count || 0));
+                    } else {
+                        result.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+                    }
+
+                    return result;
+                });
+
+                const showToast = (message, type = 'info', duration = 3000) => {
+                    const id = Date.now();
+                    toasts.value.push({ id, message, type });
+                    setTimeout(() => {
+                        toasts.value = toasts.value.filter(t => t.id !== id);
+                    }, duration);
+                };
+
+                const parseCreatorNotes = (card) => {
+                    if (!card.creator_notes) {
+                        card.tags = [];
+                        card.clean_notes = '';
+                        return;
+                    }
+                    // Extract tags starting with # (e.g. #Tag)
+                    const regex = /#(\S+)/g;
+                    const tags = [];
+                    let match;
+                    const text = card.creator_notes;
+                    
+                    while ((match = regex.exec(text)) !== null) {
+                        tags.push(match[1]);
+                    }
+                    
+                    card.tags = tags;
+                    // Remove tags from text for clean display
+                    card.clean_notes = text.replace(regex, '').trim();
+                };
+
+                const fetchCards = async () => {
+                    loading.value = true;
+                    try {
+                        const headers = {};
+                        if (isLoggedIn.value) Object.assign(headers, userAuthHeaders());
+                        const resp = await fetch(API_BASE + '/api/cards', { headers });
+                        if (!resp.ok) throw new Error('加载失败');
+                        const data = await resp.json();
+                        
+                        // Process tags for each card
+                        cards.value = (data || []).map(card => {
+                            parseCreatorNotes(card);
+                            // Use the lightweight thumbnail in lists and the full asset in detail view.
+                            card.thumbnail_url = API_BASE + '/api/cards/' + card.id + '/thumbnail';
+                            card.avatar_url = API_BASE + '/api/cards/' + card.id + '/avatar';
+                            return card;
+                        });
+                    } catch (err) {
+                        console.error('Fetch error:', err);
+                        showToast('加载失败，请检查服务器连接', 'error');
+                    } finally {
+                        loading.value = false;
+                    }
+                };
+
+                const clearPreviewAsset = () => {
+                    if (previewAsset.shouldRevoke && previewAsset.imageUrl && previewAsset.imageUrl.startsWith('blob:')) {
+                        URL.revokeObjectURL(previewAsset.imageUrl);
+                    }
+                    previewAsset.cardId = '';
+                    previewAsset.loading = false;
+                    previewAsset.ready = false;
+                    previewAsset.error = '';
+                    previewAsset.imageUrl = '';
+                    previewAsset.source = 'original';
+                    previewAsset.shouldRevoke = false;
+                };
+
+                const setPreviewAssetUrl = (url, shouldRevoke = false, source = 'original') => {
+                    if (previewAsset.shouldRevoke && previewAsset.imageUrl && previewAsset.imageUrl !== url && previewAsset.imageUrl.startsWith('blob:')) {
+                        URL.revokeObjectURL(previewAsset.imageUrl);
+                    }
+                    previewAsset.imageUrl = url;
+                    previewAsset.shouldRevoke = shouldRevoke;
+                    previewAsset.source = source;
+                };
+
+                const loadImageElement = (src) => new Promise((resolve, reject) => {
+                    const image = new Image();
+                    image.crossOrigin = 'anonymous';
+                    image.onload = () => resolve(image);
+                    image.onerror = () => reject(new Error('图片加载失败'));
+                    image.src = src;
+                });
+
+                const fetchImageObjectUrl = async (url) => {
+                    const resp = await fetch(url, { cache: 'no-store' });
+                    if (!resp.ok) {
+                        throw new Error('原图请求失败');
+                    }
+                    const blob = await resp.blob();
+                    return URL.createObjectURL(blob);
+                };
+
+                const preparePreviewAsset = async (card) => {
+                    clearPreviewAsset();
+                    previewAsset.cardId = card.id;
+                    previewAsset.loading = true;
+                    const candidates = [
+                        { url: card.avatar_url, source: 'original' },
+                        { url: card.thumbnail_url, source: 'thumbnail' },
+                        { url: defaultAvatar, source: 'fallback' }
+                    ].filter((item, index, list) => item.url && list.findIndex(entry => entry.url === item.url) === index);
+
+                    let lastError = '';
+                    for (const candidate of candidates) {
+                        let objectUrl = '';
+                        try {
+                            const finalUrl = candidate.url.startsWith('data:')
+                                ? candidate.url
+                                : (objectUrl = await fetchImageObjectUrl(candidate.url));
+                            await loadImageElement(finalUrl);
+                            if (previewAsset.cardId !== card.id) {
+                                if (objectUrl) URL.revokeObjectURL(objectUrl);
+                                return;
+                            }
+                            setPreviewAssetUrl(finalUrl, Boolean(objectUrl), candidate.source);
+                            previewAsset.ready = true;
+                            previewAsset.error = candidate.source === 'original' ? '' : '原图未能完整加载，已自动切换到可用图片。';
+                            previewAsset.loading = false;
+                            return;
+                        } catch (error) {
+                            if (objectUrl) URL.revokeObjectURL(objectUrl);
+                            lastError = error.message;
+                        }
+                    }
+
+                    setPreviewAssetUrl(defaultAvatar, false, 'fallback');
+                    previewAsset.ready = true;
+                    previewAsset.loading = false;
+                    previewAsset.error = lastError || '图片加载失败，已使用默认占位图。';
+                };
+
+                const startPreviewOpening = (card) => {
+                    const requestId = ++previewOpenRequestId;
+                    previewOpening.active = true;
+                    previewOpening.name = card?.name || '角色卡';
+                    previewOpening.imageUrl = card?.thumbnail_url || card?.avatar_url || card?.avatar || defaultAvatar;
+                    return requestId;
+                };
+
+                const stopPreviewOpening = ({ cancelPending = true } = {}) => {
+                    if (cancelPending) {
+                        previewOpenRequestId += 1;
+                    }
+                    previewOpening.active = false;
+                    previewOpening.name = '';
+                    previewOpening.imageUrl = '';
+                };
+
+                // --- Parsing Logic from Reference (Robust Version) ---
+                const readPngChunks = (buffer) => {
+                    const view = new DataView(buffer);
+                    const chunks = {};
+                    let offset = 8; // Skip PNG signature
+
+                    try {
+                        while (offset < view.byteLength) {
+                            // Guard against reading past the PNG buffer boundary.
+                            if (offset + 8 > view.byteLength) break;
+
+                            const length = view.getUint32(offset);
+                            const type = String.fromCharCode(
+                                view.getUint8(offset + 4),
+                                view.getUint8(offset + 5),
+                                view.getUint8(offset + 6),
+                                view.getUint8(offset + 7)
+                            );
+                            
+                            // Guard against invalid chunk lengths that exceed the remaining buffer.
+                            if (offset + 8 + length > view.byteLength) break;
+
+                            if (type === 'tEXt') {
+                                const data = new Uint8Array(buffer, offset + 8, length);
+                                let splitIndex = -1;
+                                for (let i = 0; i < data.length; i++) {
+                                    if (data[i] === 0) {
+                                        splitIndex = i;
+                                        break;
+                                    }
+                                }
+                                if (splitIndex !== -1) {
+                                    const key = new TextDecoder().decode(data.slice(0, splitIndex));
+                                    const value = new TextDecoder().decode(data.slice(splitIndex + 1));
+                                    chunks[key] = value;
+                                }
+                            } else if (type === 'iTXt') {
+                                const data = new Uint8Array(buffer, offset + 8, length);
+                                let p = 0;
+                                while (p < data.length && data[p] !== 0) p++;
+                                const keyword = new TextDecoder().decode(data.slice(0, p));
+                                p++;
+                                
+                                if (p + 2 <= data.length) {
+                                    const compressionFlag = data[p];
+                                    p += 2; // skip method too
+                                    
+                                    // Skip Language tag
+                                    while (p < data.length && data[p] !== 0) p++;
+                                    p++;
+                                    
+                                    // Skip Translated keyword
+                                    while (p < data.length && data[p] !== 0) p++;
+                                    p++;
+                                    
+                                    if (p < data.length) {
+                                        if (compressionFlag === 0) {
+                                            const value = new TextDecoder().decode(data.slice(p));
+                                            chunks[keyword] = value;
+                                        } else {
+                                            console.warn('Compressed iTXt chunks not fully supported yet:', keyword);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            offset += 12 + length; // Length (4) + Type (4) + Data (length) + CRC (4)
+                        }
+                    } catch (e) {
+                        console.error("Error reading PNG chunks:", e);
+                    }
+                    return chunks;
+                };
+
+                const decodeBase64Utf8 = (str) => {
+                    try {
+                        const binaryString = atob(str);
+                        const bytes = new Uint8Array(binaryString.length);
+                        for (let i = 0; i < binaryString.length; i++) {
+                            bytes[i] = binaryString.charCodeAt(i);
+                        }
+                        return new TextDecoder('utf-8').decode(bytes);
+                    } catch (e) {
+                        console.error('Base64 decode error:', e);
+                        return str;
+                    }
+                };
+
+                const handleFileSelect = (event) => {
+                    const file = event.target.files[0];
+                    if (!file) return;
+
+                    const reader = new FileReader();
+                    reader.onload = async (e) => {
+                        try {
+                            let charData = null;
+                            let avatar = defaultAvatar;
+
+                            if (file.type === 'image/png' || file.name.endsWith('.png')) {
+                                const buffer = e.target.result;
+                                const chunks = readPngChunks(buffer);
+                                // Try standard 'chara' key first
+                                let rawDataStr = chunks['chara'];
+                                
+                                // If not found, try searching for any large text chunk that looks like JSON/Base64
+                                if (!rawDataStr) {
+                                    // Some cards use 'ccv3' or other keys
+                                    for (const key in chunks) {
+                                        if (chunks[key].length > 100) { // Arbitrary threshold for "content"
+                                            try {
+                                                // Check if it's base64 encoded json
+                                                if (chunks[key].trim().startsWith('ey') || chunks[key].trim().startsWith('{')) {
+                                                    rawDataStr = chunks[key];
+                                                    console.log("Found potential data in chunk:", key);
+                                                    break;
+                                                }
+                                            } catch (e) {}
+                                        }
+                                    }
+                                }
+
+                                if (rawDataStr) {
+                                    try {
+                                        // Try decoding as base64 first
+                                        const decoded = decodeBase64Utf8(rawDataStr);
+                                        charData = JSON.parse(decoded);
+                                    } catch (e) {
+                                        try {
+                                            // Try parsing directly (if not base64)
+                                            charData = JSON.parse(rawDataStr);
+                                        } catch (e2) {
+                                            throw new Error("Unable to decode or parse character data.");
+                                        }
+                                    }
+                                }
+                                const blob = new Blob([buffer], { type: 'image/png' });
+                                avatar = await new Promise(resolve => {
+                                    const r = new FileReader();
+                                    r.onloadend = () => resolve(r.result);
+                                    r.readAsDataURL(blob);
+                                });
+                            } else {
+                                charData = JSON.parse(e.target.result);
+                            }
+
+                            if (!charData) throw new Error('无法解析角色卡数据');
+
+                            // Normalize
+                            const data = charData.data || charData;
+                            uploadingCard.value = {
+                                name: data.name || data.char_name || '未命名',
+                                description: data.description || data.char_persona || '',
+                                avatar: avatar,
+                                full_data: charData,
+                                creator_notes: data.creator_notes || ''
+                            };
+                        } catch (err) {
+                            showToast('解析失败: ' + err.message, 'error');
+                        }
+                    };
+
+                    if (file.type === 'image/png' || file.name.endsWith('.png')) {
+                        reader.readAsArrayBuffer(file);
+                    } else {
+                        reader.readAsText(file);
+                    }
+                };
+                const handleUploadClick = () => {
+                    if (!isLoggedIn.value && !isAdmin.value) {
+                        showUserAuthModal.value = true;
+                        userAuthMode.value = 'login';
+                        showToast('请先登录后再上传角色卡', 'warning');
+                        return;
+                    }
+                    showUploadModal.value = true;
+                };
+
+                const confirmUpload = async () => {
+                    if (!uploadingCard.value || isUploading.value) return;
+                    isUploading.value = true;
+                    try {
+                        const headers = isLoggedIn.value ? userAuthHeaders() : (isAdmin.value ? adminAuthHeaders() : { 'Content-Type': 'application/json' });
+                        const resp = await fetch(API_BASE + '/api/cards', {
+                            method: 'POST',
+                            headers: headers,
+                            body: JSON.stringify({
+                                name: uploadingCard.value.name,
+                                description: uploadingCard.value.description,
+                                avatar_url: uploadingCard.value.avatar,
+                                data: uploadingCard.value.full_data,
+                                creator_notes: uploadingCard.value.creator_notes
+                            })
+                        });
+                        if (!resp.ok) throw new Error('上传失败');
+                        const data = await resp.json();
+                        
+                        if (data && data.length > 0) {
+                            saveMyCardId(data[0].id);
+                        }
+
+                        // Award upload credits
+                        const creditInfo = data?.find(d => d.new_credits !== undefined);
+                        if (creditInfo && currentUser.value) {
+                            currentUser.value = { ...currentUser.value, download_credits: creditInfo.new_credits };
+                            showToast('发布成功！获得 3 次下载机会 🎉', 'success');
+                        } else {
+                            showToast('发布成功！感谢您的无私奉献！', 'success');
+                        }
+                        showUploadModal.value = false;
+                        uploadingCard.value = null;
+                        
+                        // Switch to 'mine' tab to show the new card
+                        currentTab.value = 'mine';
+                        
+                        fetchCards();
+                    } catch (err) {
+                        showToast('上传失败: ' + err.message, 'error');
+                    } finally {
+                        isUploading.value = false;
+                    }
+                };
+
+                const moveCard = async (card, direction) => {
+                    if (!isAdmin.value) return;
+                    
+                    const list = filteredCards.value;
+                    const index = list.findIndex(c => c.id === card.id);
+                    const targetIndex = index + direction;
+                    
+                    if (targetIndex < 0 || targetIndex >= list.length) return;
+                    
+                    const targetCard = list[targetIndex];
+                    const time1 = card.created_at;
+                    const time2 = targetCard.created_at;
+
+                    // If times are identical, we need to nudge one slightly to ensure order
+                    let newTime1 = time2;
+                    let newTime2 = time1;
+                    if (time1 === time2) {
+                        const d = new Date(time1);
+                        d.setMilliseconds(d.getMilliseconds() + (direction < 0 ? 1 : -1));
+                        newTime1 = d.toISOString();
+                    }
+
+                    try {
+                        // Use two independent update operations
+                        const [res1, res2] = await Promise.all([
+                            fetch(API_BASE + '/api/cards/' + card.id, {
+                                method: 'PUT',
+                                headers: adminAuthHeaders(),
+                                body: JSON.stringify({ created_at: newTime1 })
+                            }).then(r => r.json()),
+                            fetch(API_BASE + '/api/cards/' + targetCard.id, {
+                                method: 'PUT',
+                                headers: adminAuthHeaders(),
+                                body: JSON.stringify({ created_at: newTime2 })
+                            }).then(r => r.json())
+                        ]);
+                        
+                        if (!res1?.length || !res2?.length) {
+                            throw new Error('排序更新失败');
+                        }
+
+                        // Update local state
+                        const c1 = cards.value.find(c => c.id === card.id);
+                        const c2 = cards.value.find(c => c.id === targetCard.id);
+                        if (c1) c1.created_at = newTime1;
+                        if (c2) c2.created_at = newTime2;
+
+                        showToast('排序已更新', 'success');
+                    } catch (err) {
+                        console.error('Move error:', err);
+                        showToast('排序失败: ' + err.message, 'error');
+                        // Refresh to sync with DB if something went wrong
+                        fetchCards();
+                    }
+                };
+
+                const deleteCard = async (card) => {
+                    if (!confirm(`确定要删除角色卡 "${card.name}" 吗？此操作无法撤销。`)) return;
+                    
+                    try {
+                        const headers = isAdmin.value ? adminAuthHeaders() : userAuthHeaders();
+                        const resp = await fetch(API_BASE + '/api/cards/' + card.id, {
+                            method: 'DELETE',
+                            headers
+                        });
+                        const data = await resp.json();
+                            
+                        if (!resp.ok) throw new Error(data.error || '删除失败');
+
+                        // Treat an empty payload as a failed delete operation.
+                        if (!data || data.length === 0) {
+                            throw new Error('删除失败');
+                        }
+
+                        // Remove from local list if successful
+                        cards.value = cards.value.filter(c => c.id !== card.id);
+
+                        // Remove from myUploadedIds and deduct credits
+                        if (myUploadedIds.value.includes(card.id)) {
+                            myUploadedIds.value = myUploadedIds.value.filter(id => id !== card.id);
+                            safeStorage.setItem('my_uploaded_ids', JSON.stringify(myUploadedIds.value));
+                        }
+                        // Refresh user credits (server deducted 3)
+                        await refreshUserCredits();
+                        
+                        showToast('删除成功', 'success');
+                    } catch (err) {
+                        console.error('Delete error:', err);
+                        showToast('删除失败: ' + err.message, 'error');
+                    }
+                };
+
+                const applyRegexScripts = (text, content, raw) => {
+                    if (!text) return '';
+                    
+                    const charName = content.name || content.char_name || 'Character';
+                    
+                    // Detect full HTML documents so the document block can be isolated from regex processing.
+                    const htmlDocPattern = /(<!doctype html>|<html\b[^>]*>)/i;
+                    const trimmed = text.trim();
+                    const htmlMatch = trimmed.match(htmlDocPattern);
+                    
+                    let mainText = text;
+                    let protectedHtml = '';
+                    let hasProtectedHtml = false;
+                    let preText = '', postText = '';
+
+                    if (htmlMatch) {
+                        const startIndex = text.indexOf(htmlMatch[0]);
+                        const closeTag = '</html>';
+                        const closeIndex = text.toLowerCase().lastIndexOf(closeTag);
+                        
+                        if (closeIndex !== -1 && closeIndex > startIndex) {
+                            const endIndex = closeIndex + closeTag.length;
+                            protectedHtml = text.substring(startIndex, endIndex);
+                            preText = text.substring(0, startIndex);
+                            postText = text.substring(endIndex);
+                            hasProtectedHtml = true;
+                            // Macro replacement still applies to the protected HTML block.
+                            protectedHtml = protectedHtml.replace(/\{\{char\}\}/gi, charName);
+                        }
+                    }
+
+                    // Apply regex scripts only to the non-HTML segments when a protected document block exists.
+                    // Otherwise, process the full text payload.
+                    let result = hasProtectedHtml ? (preText + "___HTML_BLOCK_PLACEHOLDER___" + postText) : text;
+
+                    // 1. Apply base macro substitution to the mutable text region.
+                    result = result.replace(/\{\{char\}\}/gi, charName);
+                    
+                    // 2. Apply regex scripts using the same field resolution order as importCharacter.
+                    let scripts = [];
+                    
+                    // Path 1: V2 / SillyTavern standard location.
+                    if (content.extensions && content.extensions.regex_scripts) {
+                        scripts = content.extensions.regex_scripts;
+                    }
+                    // Path 2: extensions stored on the raw root object.
+                    else if (raw.extensions && raw.extensions.regex_scripts) {
+                        scripts = raw.extensions.regex_scripts;
+                    }
+                    // Path 3: legacy top-level regex script fields.
+                    else if (content.regex_scripts || raw.regex_scripts) {
+                        scripts = content.regex_scripts || raw.regex_scripts;
+                    }
+                    // Path 4: nested data payloads from non-standard exports.
+                    else if (content.data && content.data.extensions && content.data.extensions.regex_scripts) {
+                        scripts = content.data.extensions.regex_scripts;
+                    }
+
+                    if (scripts) {
+                        // Support both array-based and object-based script collections.
+                        const scriptList = Array.isArray(scripts) ? scripts : Object.values(scripts);
+                        console.log('[Regex] Found scripts count:', scriptList.length);
+                        
+                        scriptList.forEach(script => {
+                            try {
+                                // Normalize enablement semantics before evaluating the script.
+                                // ST uses 'disabled', we might use 'enabled' in some contexts, but ST cards usually have 'disabled'
+                                // Default is enabled if disabled is undefined or false
+                                const isDisabled = script.disabled === true;
+                                if (isDisabled) return;
+
+                                // Skip prompt-only scripts because the plaza preview is display-only.
+                                if (script.promptOnly) return;
+
+                                // Resolve the pattern, flags, and replacement fields.
+                                let regexPattern = script.regex || script.findRegex;
+                                let flags = script.flags || script.regexFlags || 'g';
+                                const replacement = script.hasOwnProperty('replacement')
+                                    ? script.replacement
+                                    : (script.replaceString || '');
+
+                                if (!regexPattern) return;
+
+                                // Parse inline /pattern/flags syntax when present.
+                                if (typeof regexPattern === 'string' && regexPattern.startsWith('/') && regexPattern.lastIndexOf('/') > 0) {
+                                    const lastSlash = regexPattern.lastIndexOf('/');
+                                    const potentialFlags = regexPattern.substring(lastSlash + 1);
+                                    // Accept only valid JavaScript regex flags.
+                                    if (/^[gimsuy]*$/.test(potentialFlags)) {
+                                        flags = potentialFlags;
+                                        regexPattern = regexPattern.substring(1, lastSlash);
+                                    }
+                                }
+                                
+                                // Convert common SillyTavern inline modifiers into JavaScript flags.
+                                if (regexPattern.includes('(?s)')) {
+                                    regexPattern = regexPattern.replace(/\(\?s\)/g, '');
+                                    if (!flags.includes('s')) flags += 's';
+                                }
+                                if (regexPattern.includes('(?i)')) {
+                                    regexPattern = regexPattern.replace(/\(\?i\)/g, '');
+                                    if (!flags.includes('i')) flags += 'i';
+                                }
+                                if (regexPattern.includes('(?m)')) {
+                                    regexPattern = regexPattern.replace(/\(\?m\)/g, '');
+                                    if (!flags.includes('m')) flags += 'm';
+                                }
+
+                                const re = new RegExp(regexPattern, flags);
+                                const oldResult = result;
+                                
+                                // Apply the replacement directly and rely on the markdown render pipeline to sanitize the output.
+                                result = result.replace(re, replacement);
+                                
+                                if (oldResult !== result) {
+                                    console.log('[Regex] Applied:', script.scriptName || script.name || regexPattern, '=>', replacement);
+                                }
+                            } catch (e) {
+                                console.warn('应用正则脚本失败:', e, script);
+                            }
+                        });
+                    } else {
+                        console.log('[Regex] No scripts found in card data');
+                    }
+                    
+                    // Restore the protected HTML document block after regex processing.
+                    if (hasProtectedHtml) {
+                        result = result.replace("___HTML_BLOCK_PLACEHOLDER___", protectedHtml);
+                    }
+                    
+                    return result;
+                };
+
+                const previewCard = async (card) => {
+                    const openingStartedAt = Date.now();
+                    const requestId = startPreviewOpening(card);
+                    let preparedPreviewCard = null;
+                    try {
+                        const bgImage = document.getElementById('mobile-bg-img');
+                        if (bgImage) {
+                            bgImage.style.opacity = '0';
+                            bgImage.style.filter = 'none';
+                            bgImage.style.transform = 'scale(1) translateZ(0)';
+                            delete bgImage.dataset.fallback;
+                        }
+                        
+                        // Fetch the full card payload lazily when the preview needs it.
+                        if (!card.data) {
+                            try {
+                                const headers = {};
+                                if (isLoggedIn.value) Object.assign(headers, userAuthHeaders());
+                                else if (isAdmin.value) Object.assign(headers, adminAuthHeaders());
+                                const resp = await fetch(API_BASE + '/api/cards/' + card.id, { headers });
+                                if (resp.ok) {
+                                    const fullCard = await resp.json();
+                                    card.data = fullCard.data;
+                                }
+                            } catch (e) {
+                                console.error('Load card data error:', e);
+                            }
+                        }
+                        
+                        const raw = card.data || {};
+                        // Prefer the V2 data payload and fall back to the legacy root object.
+                        const content = raw.data || raw;
+                        
+                        // Apply preview-time regex transformations.
+                        const processedFirstMes = applyRegexScripts(content.first_mes || '', content, raw);
+
+                        // Build a derived preview model without mutating the original export payload.
+                        preparedPreviewCard = {
+                            ...card,
+                            renderId: Date.now(), // Use a unique render key to force the preview subtree to refresh.
+                            _display: {
+                                personality: content.personality || '',
+                                first_mes: processedFirstMes,
+                                description: card.description || content.description || content.char_persona || '',
+                                name: card.name || content.name || content.char_name || ''
+                            }
+                        };
+
+                        await preparePreviewAsset(preparedPreviewCard).catch((error) => {
+                            console.error('Prepare preview asset error:', error);
+                            previewAsset.loading = false;
+                            previewAsset.ready = true;
+                            previewAsset.error = '原图加载失败，已使用默认占位图。';
+                            setPreviewAssetUrl(defaultAvatar, false, 'fallback');
+                        });
+                        
+                        // Load comments
+                        fetchComments(card.id);
+                    } finally {
+                        const elapsed = Date.now() - openingStartedAt;
+                        if (elapsed < PREVIEW_OPENING_MIN_MS) {
+                            await new Promise(resolve => setTimeout(resolve, PREVIEW_OPENING_MIN_MS - elapsed));
+                        }
+                        if (requestId === previewOpenRequestId && preparedPreviewCard) {
+                            selectedCard.value = preparedPreviewCard;
+                            stopPreviewOpening({ cancelPending: false });
+                        }
+                    }
+                };
+
+                const selectedCardHasComplexUi = computed(() => {
+                    if (!selectedCard.value) return false;
+                    const candidateText = [
+                        selectedCard.value._display?.first_mes,
+                        selectedCard.value._display?.description,
+                        selectedCard.value.description
+                    ].filter(Boolean).join('\n');
+                    return /<!doctype|<html|<iframe|<script|<style|<div|<section|<table/i.test(candidateText);
+                });
+
+                const canDownloadSelectedCard = computed(() => {
+                    if (!selectedCard.value || previewOpening.active || previewAsset.loading || !previewAsset.ready || isDownloadingCard.value) {
+                        return false;
+                    }
+                    return true;
+                });
+
+                const downloadButtonLabel = computed(() => {
+                    if (selectedCard.value) {
+                        const isOwner = isCardOwnedByCurrentUser(selectedCard.value);
+                        if (!isAdmin.value && !isOwner && !isLoggedIn.value) return '登录后下载';
+                        if (!isAdmin.value && !isOwner && downloadCredits.value <= 0) return '下载次数不足';
+                    }
+                    if (isDownloadingCard.value) return '正在生成下载文件...';
+                    if (previewAsset.loading) return '原图加载中...';
+                    if (previewAsset.source !== 'original') return '使用回退图片下载';
+                    return '下载角色卡';
+                });
+
+                const formatDate = (dateStr) => {
+                    const date = new Date(dateStr);
+                    return date.toLocaleString('zh-CN', {
+                        year: 'numeric',
+                        month: 'numeric',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit'
+                    });
+                };
+
+                // Configure marked to disable indented code blocks for better HTML support
+                marked.use({
+                    breaks: true,
+                    tokenizer: {
+                        code(src) { return undefined; }
+                    }
+                });
+
+                const createIframe = (rawHtml) => {
+                    const iframe = document.createElement('iframe');
+                    iframe.className = 'w-full border-t border-gray-200 bg-white shadow-sm block';
+                    iframe.style.height = '1px';
+                    iframe.style.overflow = 'hidden';
+                    iframe.style.transition = 'none';
+                    iframe.style.marginBottom = '0';
+                    iframe.setAttribute('scrolling', 'no');
+                    iframe.sandbox = 'allow-scripts allow-forms allow-popups allow-modals allow-same-origin';
+                    
+                    iframe.onload = function() {
+                        try {
+                            setTimeout(() => {
+                                if (this.contentWindow && this.contentWindow.document) {
+                                    const doc = this.contentWindow.document;
+                                    const height = Math.max(doc.body.scrollHeight, doc.documentElement.scrollHeight);
+                                    this.style.height = height + 'px';
+                                }
+                            }, 100);
+                        } catch (e) {
+                            console.warn('Failed to resize iframe:', e);
+                        }
+                    };
+
+                    const hudCSS = '.sinan-hud{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;padding:12px;background:linear-gradient(to bottom right,rgba(255,255,255,0.9),rgba(255,255,255,0.6));border-radius:12px;border:1px solid rgba(0,0,0,0.08);backdrop-filter:blur(4px)}.char-card{flex:1 1 140px;background:#fff;padding:10px;border-radius:8px;border-left:4px solid #ddd;box-shadow:0 2px 6px rgba(0,0,0,0.04);display:flex;flex-direction:column;gap:4px;font-size:12px;position:relative;overflow:hidden;transition:transform 0.2s}.char-card:hover{transform:translateY(-2px);box-shadow:0 4px 8px rgba(0,0,0,0.1)}.char-name{font-weight:700;font-size:14px;color:#374151;display:flex;justify-content:space-between;align-items:center}.char-mood{color:#6b7280;font-size:12px}.char-loc{color:#9ca3af;font-size:11px;margin-top:auto;padding-top:4px}.bar-bg{height:4px;background:#f3f4f6;border-radius:2px;overflow:hidden;margin-top:6px}.bar-fill{height:100%;background:#10b981;border-radius:2px}.c-tongqiu{border-left-color:#f59e0b}.c-tongqiu .bar-fill{background:#f59e0b}.c-yufan{border-left-color:#3b82f6}.c-yufan .bar-fill{background:#3b82f6}.c-linghu{border-left-color:#8b5cf6}.c-linghu .bar-fill{background:#8b5cf6}.c-chongtian{border-left-color:#ef4444}.c-chongtian .bar-fill{background:#ef4444}';
+                    const resetStyle = '<style>html,body{margin:0 !important;padding:0 !important;width:100% !important;max-width:100% !important;min-width:0 !important;word-wrap:break-word !important;overflow-wrap:anywhere !important;box-sizing:border-box !important;overflow-x:hidden !important;overflow-y:hidden !important;} body{position:relative !important;isolation:isolate !important;} ::-webkit-scrollbar{display:none;} *,*::before,*::after{box-sizing:inherit !important;max-width:100% !important;} img,video,canvas,svg,iframe{max-width:100% !important;height:auto !important;} table{display:block !important;width:100% !important;overflow-x:auto !important;max-width:100% !important;-webkit-overflow-scrolling:touch !important;} pre,code{white-space:pre-wrap !important;word-wrap:break-word !important;overflow-wrap:anywhere !important;max-width:100% !important;} .container, .reality-panel, main, section, article, aside, header, footer, div {max-width:100% !important; width:auto !important;} .container, .reality-panel {width:100% !important; margin:0 !important; border-radius:0 !important; box-shadow:none !important; border:none !important;} body > div:first-child {margin:0 !important; max-width:100% !important;} ' + hudCSS + '</style>';
+                    const metaViewport = '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">';
+                    const jqueryScript = '<script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js" defer><\/script>';
+                    const scriptShim = `
+                        <script>
+                            window.triggerSlash = function(text) {
+                                console.log('Slash triggered:', text);
+                                try {
+                                    window.parent.postMessage({ type: 'slash_command', content: text }, '*');
+                                } catch (e) {
+                                    console.error('TriggerSlash error:', e);
+                                }
+                            };
+                            let lastHeight = 0;
+                            let heightFrame = 0;
+                            function readHeight() {
+                                const body = document.body;
+                                const html = document.documentElement;
+                                if (!body || !html) return 0;
+                                return Math.max(
+                                    body.scrollHeight,
+                                    body.offsetHeight,
+                                    body.clientHeight,
+                                    html.scrollHeight,
+                                    html.offsetHeight,
+                                    html.clientHeight
+                                );
+                            }
+                            function applyHeight(force) {
+                                if (!window.frameElement) return;
+                                const measuredHeight = Math.max(1, Math.ceil(readHeight()));
+                                if (!force && Math.abs(measuredHeight - lastHeight) < 2) return;
+                                lastHeight = measuredHeight;
+                                window.frameElement.style.height = measuredHeight + 'px';
+                            }
+                            function scheduleHeightUpdate(force) {
+                                if (heightFrame) cancelAnimationFrame(heightFrame);
+                                heightFrame = requestAnimationFrame(() => {
+                                    heightFrame = 0;
+                                    applyHeight(force);
+                                });
+                            }
+                            window.addEventListener('load', () => { scheduleHeightUpdate(true); setTimeout(() => scheduleHeightUpdate(true), 200); });
+                            window.addEventListener('resize', () => scheduleHeightUpdate(false));
+                            window.addEventListener('click', () => { setTimeout(() => scheduleHeightUpdate(false), 100); setTimeout(() => scheduleHeightUpdate(false), 300); });
+                            window.addEventListener('DOMContentLoaded', () => {
+                                document.querySelectorAll('img').forEach(img => img.addEventListener('load', () => scheduleHeightUpdate(true)));
+                                scheduleHeightUpdate(true);
+                            });
+                            if (window.ResizeObserver) {
+                                const ro = new ResizeObserver(() => scheduleHeightUpdate(false));
+                                const observeTargets = () => {
+                                    if (document.documentElement) ro.observe(document.documentElement);
+                                    if (document.body) ro.observe(document.body);
+                                };
+                                if (document.body) observeTargets();
+                                else window.addEventListener('DOMContentLoaded', observeTargets, { once: true });
+                            }
+                            if (window.MutationObserver) {
+                                const mo = new MutationObserver(() => scheduleHeightUpdate(false));
+                                const observeMutations = () => {
+                                    if (document.body) {
+                                        mo.observe(document.body, { childList: true, subtree: true, attributes: true, characterData: true });
+                                    }
+                                };
+                                if (document.body) observeMutations();
+                                else window.addEventListener('DOMContentLoaded', observeMutations, { once: true });
+                            } else {
+                                setInterval(() => scheduleHeightUpdate(false), 1500);
+                            }
+                        <\/script>
+                    `;
+                    
+                    let content = rawHtml;
+                    const trimmed = content.trim();
+                    const isStandardDoc = /^\s*(<!doctype|<html)/i.test(trimmed);
+
+                    if (isStandardDoc) {
+                        const headRegex = /<head(\s[^>]*)?>/i;
+                        const htmlRegex = /<html(\s[^>]*)?>/i;
+                        if (headRegex.test(content)) {
+                            content = content.replace(headRegex, (match) => match + metaViewport + resetStyle + jqueryScript + scriptShim);
+                        } else if (htmlRegex.test(content)) {
+                            content = content.replace(htmlRegex, (match) => match + '<head>' + metaViewport + resetStyle + jqueryScript + scriptShim + '</head>');
+                        } else {
+                            content = metaViewport + resetStyle + jqueryScript + scriptShim + content;
+                        }
+                    } else {
+                        content = `<!DOCTYPE html><html><head>${metaViewport}${resetStyle}${jqueryScript}${scriptShim}</head><body>${rawHtml}</body></html>`;
+                    }
+
+                    iframe.srcdoc = content;
+                    return iframe;
+                };
+
+                const fetchComments = async (cardId) => {
+                    loadingComments.value = true;
+                    comments.value = [];
+                    try {
+                        const headers = isLoggedIn.value ? { 'Authorization': 'Bearer ' + userToken.value } : {};
+                        const resp = await fetch(API_BASE + '/api/cards/' + cardId + '/comments', { headers });
+                        if (!resp.ok) throw new Error('获取评论失败');
+                        const data = await resp.json();
+                        comments.value = data || [];
+                    } catch (err) {
+                        console.error('Error fetching comments:', err);
+                    } finally {
+                        loadingComments.value = false;
+                    }
+                };
+
+                const submitComment = async () => {
+                    if (!isLoggedIn.value) {
+                        showUserAuthModal.value = true;
+                        showToast('请先登录后再评论', 'warning');
+                        return;
+                    }
+                    if (!newComment.content.trim()) {
+                        showToast('请输入评论内容', 'warning');
+                        return;
+                    }
+                    if (newComment.content.trim().length < 5) {
+                        showToast('评论不能少于5个字', 'warning');
+                        return;
+                    }
+                    if (!selectedCard.value) return;
+
+                    try {
+                        const resp = await fetch(API_BASE + '/api/cards/' + selectedCard.value.id + '/comments', {
+                            method: 'POST',
+                            headers: userAuthHeaders(),
+                            body: JSON.stringify({ content: newComment.content.trim(), reply_to_id: newComment.reply_to_id || undefined })
+                        });
+                        if (!resp.ok) {
+                            const err = await resp.json();
+                            throw new Error(err.error || '评论失败');
+                        }
+                        const data = await resp.json();
+
+                        if (data && data.comment) {
+                            comments.value.push(data.comment);
+                            // Auto-expand replies for the root comment this reply belongs to
+                            if (data.comment.reply_to_id) {
+                                const byId = {};
+                                comments.value.forEach(c => byId[c.id] = c);
+                                function findRoot(c, visited) {
+                                    if (!c.reply_to_id) return c.id;
+                                    if (visited.has(c.id)) return c.id;
+                                    visited.add(c.id);
+                                    const parent = byId[c.reply_to_id];
+                                    if (!parent) return c.id;
+                                    return findRoot(parent, visited);
+                                }
+                                const rootId = findRoot(data.comment, new Set());
+                                const s = new Set(expandedComments.value);
+                                s.add(rootId);
+                                expandedComments.value = s;
+                            }
+                        }
+                        
+                        // Update credits from server response
+                        if (data.new_credits !== undefined && currentUser.value) {
+                            currentUser.value = { ...currentUser.value, download_credits: data.new_credits };
+                        }
+                        newComment.content = '';
+                        newComment.reply_to_id = null;
+                        newComment.reply_to_name = '';
+                            showToast('评论发布成功！获得 2 次下载机会', 'success');
+                    } catch (err) {
+                        console.error('Error submitting comment:', err);
+                        showToast('评论失败: ' + err.message, 'error');
+                    }
+                };
+
+                const replyToComment = (comment) => {
+                    if (!isLoggedIn.value) {
+                        showUserAuthModal.value = true;
+                        userAuthMode.value = 'login';
+                        showToast('请先登录后再回复', 'warning');
+                        return;
+                    }
+                    newComment.reply_to_id = comment.id;
+                    newComment.reply_to_name = comment.author_name || comment.nickname;
+                    newComment.content = '';
+                };
+
+                const cancelReply = () => {
+                    newComment.reply_to_id = null;
+                    newComment.reply_to_name = '';
+                };
+
+                const likeCard = async (card) => {
+                    if (!isLoggedIn.value) {
+                        showUserAuthModal.value = true;
+                        userAuthMode.value = 'login';
+                        showToast('请先登录后再点赞', 'warning');
+                        return;
+                    }
+                    try {
+                        const resp = await fetch(API_BASE + '/api/cards/' + card.id + '/like', {
+                            method: 'POST',
+                            headers: userAuthHeaders()
+                        });
+                        if (!resp.ok) {
+                            const err = await resp.json();
+                            throw new Error(err.error || '操作失败');
+                        }
+                        const data = await resp.json();
+
+                        // Update card in list
+                        const idx = cards.value.findIndex(c => c.id === card.id);
+                        if (idx !== -1) {
+                            cards.value[idx] = { ...cards.value[idx], likes_count: data.likes_count, user_liked: data.liked ? 1 : 0 };
+                        }
+
+                        showToast(data.liked ? '点赞成功' : '已取消点赞', data.liked ? 'success' : 'info');
+                    } catch (err) {
+                        console.error('Card like error:', err);
+                        showToast(err.message, 'error');
+                    }
+                };
+
+                const likeComment = async (comment) => {
+                    if (!isLoggedIn.value) {
+                        showUserAuthModal.value = true;
+                        showToast('请先登录后再点赞', 'warning');
+                        return;
+                    }
+                    try {
+                        const resp = await fetch(API_BASE + '/api/comments/' + comment.id + '/like', {
+                            method: 'POST',
+                            headers: userAuthHeaders()
+                        });
+                        if (!resp.ok) {
+                            const err = await resp.json();
+                            throw new Error(err.error || '操作失败');
+                        }
+                        const data = await resp.json();
+                        
+                        // Update comment in list
+                        const idx = comments.value.findIndex(c => c.id === comment.id);
+                        if (idx !== -1) {
+                            comments.value[idx] = { ...comments.value[idx], likes_count: data.likes_count, user_liked: data.liked };
+                        }
+                        
+                        // Recalculate hot comment
+                        const maxLikes = Math.max(...comments.value.map(c => c.likes_count || 0));
+                        comments.value.forEach(c => {
+                            c.is_hot = c.likes_count >= 5 && c.likes_count === maxLikes;
+                        });
+                        
+                        // Update credits if liked (not unliked)
+                        if (data.liked) {
+                            showToast('点赞成功', 'success');
+                        } else if (!data.liked) {
+                            showToast('已取消点赞', 'info');
+                        }
+                    } catch (err) {
+                        console.error('Like error:', err);
+                        showToast(err.message, 'error');
+                    }
+                };
+
+                const deleteComment = async (commentId) => {
+                    if (!confirm('确定要删除这条评论吗？')) return;
+                    try {
+                        const resp = await fetch(API_BASE + '/api/comments/' + commentId, {
+                            method: 'DELETE',
+                            headers: adminAuthHeaders()
+                        });
+                        if (!resp.ok) throw new Error('删除失败');
+                        
+                        comments.value = comments.value.filter(c => c.id !== commentId);
+                        showToast('评论已删除', 'success');
+                    } catch (err) {
+                        console.error('Delete comment error:', err);
+                        showToast('删除失败: ' + err.message, 'error');
+                    }
+                };
+
+                const renderMarkdown = (text) => {
+                    if (!text) return '';
+                    const trimmed = text.trim();
+                    
+                    const cleanConfig = {
+                        ADD_TAGS: ['details', 'summary', 'iframe', 'svg', 'path', 'g', 'circle', 'rect', 'defs', 'linearGradient', 'stop', 'style', 'div', 'span', 'script', 'button', 'input'],
+                        ADD_ATTR: ['style', 'open', 'srcdoc', 'sandbox', 'frameborder', 'allow', 'allowfullscreen', 'class', 'id', 'viewBox', 'fill', 'stroke', 'stroke-width', 'd', 'stroke-linecap', 'stroke-linejoin', 'x1', 'y1', 'x2', 'y2', 'offset', 'stop-color', 'stop-opacity', 'width', 'height', 'onclick', 'type', 'value', 'checked'],
+                        FORBID_ATTR: ['onmouseover', 'onload'],
+                        FORCE_BODY: true
+                    };
+
+                    // Check for HTML Document
+                    const htmlDocPattern = /(<!doctype html>|<html\b[^>]*>)/i;
+                    const htmlMatch = trimmed.match(htmlDocPattern);
+                    
+                    if (htmlMatch && !trimmed.includes('```')) {
+                        const startIndex = htmlMatch.index;
+                        const closeTag = '</html>';
+                        const closeIndex = trimmed.toLowerCase().lastIndexOf(closeTag);
+                        
+                        let htmlContent, preText, postText;
+                        if (closeIndex !== -1 && closeIndex > startIndex) {
+                            const endIndex = closeIndex + closeTag.length;
+                            htmlContent = trimmed.substring(startIndex, endIndex);
+                            preText = trimmed.substring(0, startIndex);
+                            postText = trimmed.substring(endIndex);
+                        } else {
+                            htmlContent = trimmed.substring(startIndex);
+                            preText = trimmed.substring(0, startIndex);
+                            postText = '';
+                        }
+
+                        let resultHtml = '';
+                        if (preText.trim()) resultHtml += DOMPurify.sanitize(marked.parse(preText), cleanConfig);
+                        
+                        const container = document.createElement('div');
+                        container.className = 'html-card-container';
+                        container.style.marginBottom = '-1px';
+                        container.appendChild(createIframe(htmlContent));
+                        resultHtml += container.outerHTML;
+                        
+                        if (postText.trim()) resultHtml += DOMPurify.sanitize(marked.parse(postText), cleanConfig);
+                        return resultHtml;
+                    }
+
+                    // Smart detection for block HTML (without standard doc tags)
+                    const startsWithBlockHtml = /^\s*<(div|table|section|article|aside|header|footer|style|script)/i.test(trimmed);
+                    if (startsWithBlockHtml && !trimmed.includes('```')) {
+                        // Render raw HTML fragments inside an iframe to preserve interactive handlers and isolate styles.
+                        const container = document.createElement('div');
+                        container.className = 'html-card-container';
+                        container.style.marginBottom = '-1px';
+                        container.appendChild(createIframe(text));
+                        return container.outerHTML;
+                    }
+
+                    // Standard Markdown
+                    return DOMPurify.sanitize(marked.parse(text), cleanConfig);
+                };
+
+                const renderCardPreview = (text) => {
+                    if (!text) return '暂无描述';
+                    const trimmed = String(text).trim();
+                    if (!trimmed) return '暂无描述';
+
+                    const htmlLike = /(<!doctype html>|<html\b[^>]*>|^\s*<(div|table|section|article|aside|header|footer|style|script|iframe)\b)/i.test(trimmed) && !trimmed.includes('```');
+                    const source = htmlLike ? trimmed : DOMPurify.sanitize(marked.parse(trimmed), { FORCE_BODY: true });
+                    const container = document.createElement('div');
+                    container.innerHTML = source;
+                    const plainText = (container.textContent || container.innerText || '')
+                        .replace(/\s+/g, ' ')
+                        .trim();
+
+                    if (!plainText) {
+                        return htmlLike ? '该角色卡包含自定义界面，请点进详情查看完整效果。' : '暂无描述';
+                    }
+
+                    return plainText.length > 140 ? plainText.slice(0, 140) + '…' : plainText;
+                };
+
+                const downloadCard = async (card) => {
+                    // Require login to download
+                    const isOwner = isCardOwnedByCurrentUser(card);
+                    if (!isAdmin.value && !isOwner && !isLoggedIn.value) {
+                        showUserAuthModal.value = true;
+                        userAuthMode.value = 'login';
+                        showToast('请先登录后再下载', 'warning', 4000);
+                        return;
+                    }
+
+                    // Credit Check
+                    if (!isAdmin.value && !isOwner) {
+                        if (downloadCredits.value <= 0) {
+                            if (!isLoggedIn.value) {
+                                showUserAuthModal.value = true;
+                                showToast('请登录后获取下载次数', 'warning', 4000);
+                            } else {
+                            showToast('下载次数不足！评论1次，点赞1次可获得更多', 'warning', 4000);
+                            }
+                            return;
+                        }
+                    }
+
+                    isDownloadingCard.value = true;
+                    try {
+                        const headers = isLoggedIn.value ? userAuthHeaders() : (isAdmin.value ? adminAuthHeaders() : { 'Content-Type': 'application/json' });
+                        const resp = await fetch(API_BASE + '/api/cards/' + card.id + '/download', {
+                            method: 'POST',
+                            headers
+                        });
+                        const data = await resp.json().catch(() => ({}));
+                        if (!resp.ok) {
+                            throw new Error(data.error || '下载次数更新失败');
+                        }
+
+                        const listCard = cards.value.find(item => item.id === card.id);
+                        if (listCard) {
+                            listCard.downloads_count = (listCard.downloads_count || 0) + 1;
+                        }
+                        card.downloads_count = (card.downloads_count || 0) + 1;
+                        if (selectedCard.value && selectedCard.value.id === card.id) {
+                            selectedCard.value.downloads_count = card.downloads_count;
+                        }
+                        if (data.new_credits !== undefined && currentUser.value) {
+                            currentUser.value = { ...currentUser.value, download_credits: data.new_credits };
+                        }
+
+                        if (!data.download_url) {
+                            throw new Error('下载链接生成失败');
+                        }
+
+                        const a = document.createElement('a');
+                        a.href = data.download_url;
+                        a.rel = 'noopener';
+                        a.style.display = 'none';
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                        showToast('下载已开始', 'success');
+                    } catch (err) {
+                        console.error('Download error:', err);
+                        showToast(err.message || '下载失败', 'error', 4000);
+                    } finally {
+                        isDownloadingCard.value = false;
+                    }
+                };
+
+                // ============== Edit Card ==============
+                const editingCard = ref(null);
+                const showEditModal = ref(false);
+                const isEditUploading = ref(false);
+
+                const startEditCard = (card) => {
+                    editingCard.value = {
+                        id: card.id,
+                        name: card.name,
+                        description: card.description || '',
+                        avatar_url: card.avatar_url || card.avatar || '',
+                        creator_notes: card.creator_notes || '',
+                        data: card.data,
+                        full_data: card.data
+                    };
+                    showEditModal.value = true;
+                };
+
+                const handleEditFileSelect = (e) => {
+                    const file = e.target.files[0];
+                    if (!file) return;
+                    const reader = new FileReader();
+                    if (file.name.endsWith('.json')) {
+                        reader.onload = (ev) => {
+                            try {
+                                const json = JSON.parse(ev.target.result);
+                                editingCard.value.full_data = json;
+                                editingCard.value.creator_notes = json.data?.creator_notes || editingCard.value.creator_notes;
+                                if (json.data?.avatar) editingCard.value.avatar_url = json.data.avatar;
+                                showToast('JSON 解析成功', 'success');
+                            } catch { showToast('JSON 解析失败', 'error'); }
+                        };
+                        reader.readAsText(file);
+                    } else if (file.name.endsWith('.png')) {
+                        reader.onload = (ev) => {
+                            try {
+                                const arr = new Uint8Array(ev.target.result);
+                                let idx = 8;
+                                while (idx + 8 <= arr.length) {
+                                    if (idx + 4 > arr.length) break;
+                                    const len = (arr[idx]<<24)|(arr[idx+1]<<16)|(arr[idx+2]<<8)|arr[idx+3];
+                                    const type = String.fromCharCode(arr[idx+4],arr[idx+5],arr[idx+6],arr[idx+7]);
+                                    if (len < 0 || idx + 12 + len > arr.length) break;
+                                    if (type === 'tEXt') {
+                                        const data = arr.slice(idx+8, idx+8+len);
+                                        const sep = data.indexOf(0);
+                                        const val = new TextDecoder().decode(data.slice(sep+1));
+                                        try {
+                                            const json = JSON.parse(val);
+                                            editingCard.value.full_data = json;
+                                            editingCard.value.creator_notes = json.data?.creator_notes || editingCard.value.creator_notes;
+                                        } catch {}
+                                    }
+                                    idx += 12 + len;
+                                }
+                                const blob = new Blob([arr], { type: 'image/png' });
+                                editingCard.value.avatar_url = URL.createObjectURL(blob);
+                                showToast('PNG 解析成功', 'success');
+                            } catch { showToast('PNG 解析失败', 'error'); }
+                        };
+                        reader.readAsArrayBuffer(file);
+                    }
+                };
+
+                const confirmEditCard = async () => {
+                    if (!editingCard.value || isEditUploading.value) return;
+                    isEditUploading.value = true;
+                    try {
+                        const headers = isLoggedIn.value ? userAuthHeaders() : adminAuthHeaders();
+                        const editPayload = {
+                            name: editingCard.value.name,
+                            description: editingCard.value.description,
+                            data: editingCard.value.full_data,
+                            creator_notes: editingCard.value.creator_notes
+                        };
+                        // Persist avatar data only when the editor is holding a newly uploaded data URL.
+                        if (editingCard.value.avatar_url && editingCard.value.avatar_url.startsWith('data:')) {
+                            editPayload.avatar_url = editingCard.value.avatar_url;
+                        }
+                        const resp = await fetch(API_BASE + '/api/cards/' + editingCard.value.id, {
+                            method: 'PUT',
+                            headers: headers,
+                            body: JSON.stringify(editPayload)
+                        });
+                        if (!resp.ok) {
+                            const err = await resp.json().catch(() => ({}));
+                            throw new Error(err.error || '更新失败');
+                        }
+                        const data = await resp.json();
+                        if (data && data.length > 0) {
+                            const idx = cards.value.findIndex(c => c.id === editingCard.value.id);
+                            if (idx !== -1) cards.value[idx] = { ...cards.value[idx], ...data[0] };
+                        }
+                        showToast('修改成功', 'success');
+                        showEditModal.value = false;
+                        editingCard.value = null;
+                        if (selectedCard.value && selectedCard.value.id === data[0]?.id) {
+                            selectedCard.value = { ...selectedCard.value, ...data[0] };
+                        }
+                    } catch (err) {
+                        showToast('修改失败: ' + err.message, 'error');
+                    } finally {
+                        isEditUploading.value = false;
+                    }
+                };
+
+                // ============== Tag expand state ==============
+                const tagsExpanded = ref(false);
+                const showTagLibrary = ref(false);
+
+                // ============== Pagination ==============
+                const PAGE_SIZE = 10;
+                const currentPage = ref(1);
+
+                const totalPages = computed(() => Math.ceil(filteredCards.value.length / PAGE_SIZE));
+
+                const pagedCards = computed(() => {
+                    const start = (currentPage.value - 1) * PAGE_SIZE;
+                    return filteredCards.value.slice(start, start + PAGE_SIZE);
+                });
+
+                const pageNumbers = computed(() => {
+                    const total = totalPages.value;
+                    const cur = currentPage.value;
+                    if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
+                    const pages = [];
+                    pages.push(1);
+                    if (cur > 3) pages.push('...');
+                    for (let p = Math.max(2, cur - 1); p <= Math.min(total - 1, cur + 1); p++) pages.push(p);
+                    if (cur < total - 2) pages.push('...');
+                    pages.push(total);
+                    return pages;
+                });
+
+                // Reset to page 1 when filters change
+                watch([searchQuery, cardSort, currentTab], () => { currentPage.value = 1; });
+                watch(selectedCard, (card) => {
+                    if (!card) {
+                        clearPreviewAsset();
+                    }
+                });
+
+                // ============== Visit Tracking ==============
+                const totalVisits = ref(0);
+
+                const trackVisit = async () => {
+                    try {
+                        await fetch(API_BASE + '/api/track/visit', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ path: window.location.pathname })
+                        });
+                    } catch {}
+                };
+
+                const fetchVisits = async () => {
+                    try {
+                        const resp = await fetch(API_BASE + '/api/stats/visits');
+                        if (resp.ok) {
+                            const data = await resp.json();
+                            totalVisits.value = data.totalVisits || 0;
+                        }
+                    } catch {}
+                };
+
+                onMounted(() => {
+                    loadPublicSettings();
+                    fetchCards();
+                    checkAdminToken();
+                    checkUserToken();
+                    trackVisit();
+                    fetchVisits();
+                    window.addEventListener('resize', handleWindowResize);
+                    window.addEventListener('focus', handleWindowFocus);
+                    document.addEventListener('visibilitychange', handleVisibilityChange);
+                    document.addEventListener('click', () => { showSortDropdown.value = false; });
+                    window.addEventListener('message', (event) => {
+                        if (event.data && event.data.type === 'slash_command') {
+                            showToast(`触发指令：${event.data.content}`, 'success');
+                        }
+                    });
+                });
+
+                onUnmounted(() => {
+                    window.removeEventListener('resize', handleWindowResize);
+                    window.removeEventListener('focus', handleWindowFocus);
+                    document.removeEventListener('visibilitychange', handleVisibilityChange);
+                });
+
+                return {
+                    cards, cardSort, showSortDropdown, loading, searchQuery, filteredCards, pagedCards, defaultAvatar,
+                    showUploadModal, showSearchModal, uploadingCard, isUploading, handleFileSelect, confirmUpload, handleUploadClick,
+                    selectedCard, previewCard, formatDate, downloadCard, deleteCard, moveCard,
+                    previewOpening, stopPreviewOpening,
+                    toasts, currentTab, myUploadedIds, popularTags, visiblePopularTags, showPopularTagsToggle, modalPopularTags, searchTag,
+                    handleMobileScroll,
+                    isAdmin, handleLogoClick, handleAdminLogout, renderMarkdown, renderCardPreview,
+                    showAdminLogin, adminLoginForm, adminLoginError, handleAdminLogin,
+                    comments, loadingComments, newComment, submitComment, deleteComment, likeComment, likeCard, replyToComment, cancelReply,
+                    commentTree, expandedComments, toggleReplies,
+                    downloadCredits,
+                    previewAsset, canDownloadSelectedCard, downloadButtonLabel, selectedCardHasComplexUi,
+                    // User Auth
+                    isLoggedIn, currentUser, showUserAuthModal, userAuthMode, userAuthForm, userAuthError,
+                    handleUserAuth, handleUserLogout,
+                    // Edit Card
+                    editingCard, showEditModal, isEditUploading, startEditCard, handleEditFileSelect, confirmEditCard,
+                    // Visit Tracking
+                    totalVisits,
+                    tagsExpanded, showTagLibrary, allTags,
+                    currentPage, totalPages, pageNumbers
+                };
             }
-        });
-        deleteAndReclaim();
-        thumbnailCache.delete(req.params.id);
-        logOperation({ userType: 'admin', userId: req.admin.id, username: req.admin.username, action: 'admin_delete_card', targetType: 'card', targetId: req.params.id, ip: req.ip, details: { name: card?.name } });
-        res.json({ success: true });
-    } catch (err) {
-        console.error('Admin delete card error:', err);
-        res.status(500).json({ error: '删除失败' });
-    }
-});
+        }).mount('#app');
+    </script>
+</body>
+</html>
 
-app.get('/api/admin/comments', authenticateAdmin, (req, res) => {
-    try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 20;
-        const offset = (page - 1) * limit;
-
-        const total = db.prepare('SELECT COUNT(*) as count FROM character_comments').get().count;
-        const comments = db.prepare(
-            `SELECT c.*, cc.name as card_name 
-             FROM character_comments c 
-             LEFT JOIN character_cards cc ON c.card_id = cc.id 
-             ORDER BY c.created_at DESC LIMIT ? OFFSET ?`
-        ).all(limit, offset);
-
-        res.json({ comments, total, page, limit, totalPages: Math.ceil(total / limit) });
-    } catch (err) {
-        console.error('Admin comments error:', err);
-        res.status(500).json({ error: '获取评论列表失败' });
-    }
-});
-
-app.delete('/api/admin/comments/:id', authenticateAdmin, (req, res) => {
-    try {
-        const comment = db.prepare('SELECT content FROM character_comments WHERE id = ?').get(req.params.id);
-        const result = db.prepare('DELETE FROM character_comments WHERE id = ?').run(req.params.id);
-        if (result.changes === 0) return res.status(404).json({ error: '评论不存在' });
-        logOperation({ userType: 'admin', userId: req.admin.id, username: req.admin.username, action: 'admin_delete_comment', targetType: 'comment', targetId: req.params.id, ip: req.ip, details: { content: comment?.content?.substring(0, 50) } });
-        res.json({ success: true });
-    } catch (err) {
-        console.error('Admin delete comment error:', err);
-        res.status(500).json({ error: '删除失败' });
-    }
-});
-
-app.get('/api/admin/settings', authenticateAdmin, (req, res) => {
-    try {
-        const settings = db.prepare('SELECT key, value FROM settings').all();
-        const result = {};
-        settings.forEach(s => { result[s.key] = s.value; });
-        res.json(result);
-    } catch (err) {
-        res.status(500).json({ error: '获取设置失败' });
-    }
-});
-
-const PUBLIC_SETTINGS_KEYS = new Set([
-    'site_name',
-    'site_description',
-    'allow_anonymous_upload',
-    'allow_anonymous_comment',
-    'popular_tags',
-    'tag_library',
-    'hidden_popular_tags',
-    'hidden_tag_library'
-]);
-
-app.get('/api/settings', (req, res) => {
-    try {
-        const settings = db.prepare('SELECT key, value FROM settings').all();
-        const result = {};
-        settings.forEach((setting) => {
-            if (PUBLIC_SETTINGS_KEYS.has(setting.key)) {
-                result[setting.key] = setting.value;
-            }
-        });
-        res.json(result);
-    } catch (err) {
-        console.error('Public settings error:', err);
-        res.status(500).json({ error: '获取站点设置失败' });
-    }
-});
-
-const ALLOWED_SETTINGS_KEYS = new Set([
-    'site_name', 'site_description', 'allow_anonymous_upload',
-    'allow_anonymous_comment', 'max_upload_size_mb',
-    'popular_tags', 'tag_library',
-    'hidden_popular_tags', 'hidden_tag_library'
-]);
-
-const TAG_SETTING_KEYS = new Set([
-    'popular_tags',
-    'tag_library',
-    'hidden_popular_tags',
-    'hidden_tag_library'
-]);
-
-const MAX_TAG_SETTING_LENGTH = 5000;
-const MAX_TAG_COUNT = 300;
-const MAX_TAG_LENGTH = 40;
-
-function parseTagSettingValue(value) {
-    return String(value || '')
-        .split(/[\n,，]/)
-        .map(item => item.trim())
-        .filter(Boolean)
-        .filter((item, index, array) => array.indexOf(item) === index);
-}
-
-function validateTagSettingValue(key, value) {
-    const raw = String(value || '');
-    if (raw.length > MAX_TAG_SETTING_LENGTH) {
-        return `${key} 内容过长`;
-    }
-    const tags = parseTagSettingValue(raw);
-    if (tags.length > MAX_TAG_COUNT) {
-        return `${key} 标签数量过多`;
-    }
-    if (tags.some(tag => tag.length > MAX_TAG_LENGTH)) {
-        return `${key} 中存在过长标签`;
-    }
-    return '';
-}
-
-app.put('/api/admin/settings', authenticateAdmin, (req, res) => {
-    try {
-        const updates = req.body;
-        for (const [key, value] of Object.entries(updates)) {
-            if (!ALLOWED_SETTINGS_KEYS.has(key)) continue;
-            if (!TAG_SETTING_KEYS.has(key)) continue;
-            const error = validateTagSettingValue(key, value);
-            if (error) {
-                return res.status(400).json({ error });
-            }
-        }
-        const stmt = db.prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)');
-        const now = new Date().toISOString();
-        for (const [key, value] of Object.entries(updates)) {
-            if (!ALLOWED_SETTINGS_KEYS.has(key)) continue;
-            stmt.run(key, String(value), now);
-        }
-        logOperation({
-            userType: 'admin',
-            userId: req.admin.id,
-            username: req.admin.username,
-            action: 'admin_update_tag_settings',
-            targetType: 'settings',
-            targetId: 'tag-management',
-            ip: req.ip,
-            details: {
-                popular_tags_count: parseTagSettingValue(updates.popular_tags).length,
-                tag_library_count: parseTagSettingValue(updates.tag_library).length,
-                hidden_popular_tags_count: parseTagSettingValue(updates.hidden_popular_tags).length,
-                hidden_tag_library_count: parseTagSettingValue(updates.hidden_tag_library).length
-            }
-        });
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: '更新设置失败' });
-    }
-});
-
-app.put('/api/admin/password', authenticateAdmin, async (req, res) => {
-    try {
-        const { currentPassword, newPassword } = req.body;
-        if (!currentPassword || !newPassword) {
-            return res.status(400).json({ error: '请输入当前密码和新密码' });
-        }
-        if (newPassword.length < 6) {
-            return res.status(400).json({ error: '新密码长度至少6位' });
-        }
-        const user = db.prepare('SELECT * FROM admin_users WHERE id = ?').get(req.admin.id);
-        if (!user || !(await bcrypt.compare(currentPassword, user.password_hash))) {
-            return res.status(401).json({ error: '当前密码错误' });
-        }
-        const hash = await bcrypt.hash(newPassword, 12);
-        db.prepare('UPDATE admin_users SET password_hash = ? WHERE id = ?').run(hash, user.id);
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: '修改密码失败' });
-    }
-});
-
-app.get('/api/admin/logs', authenticateAdmin, (req, res) => {
-    try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 50;
-        const offset = (page - 1) * limit;
-        const action = req.query.action || '';
-
-        let where = '';
-        const params = [];
-        if (action) { where = ' WHERE action = ?'; params.push(action); }
-        
-        const total = db.prepare(`SELECT COUNT(*) as count FROM operation_logs${where}`).get(...params).count;
-        const logs = db.prepare(
-            `SELECT * FROM operation_logs${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`
-        ).all(...params, limit, offset);
-
-        res.json({ logs, total, page, limit, totalPages: Math.ceil(total / limit) });
-    } catch (err) {
-        res.status(500).json({ error: '获取日志失败' });
-    }
-});
-
-// ============== Admin User Management ==============
-app.get('/api/admin/users', authenticateAdmin, (req, res) => {
-    try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 20;
-        const offset = (page - 1) * limit;
-        const search = req.query.search || '';
-
-        let where = '';
-        const params = [];
-        if (search) {
-            where = ' WHERE username LIKE ?';
-            params.push(`%${search}%`);
-        }
-        const total = db.prepare(`SELECT COUNT(*) as count FROM users${where}`).get(...params).count;
-        const users = db.prepare(
-            `SELECT id, username, download_credits, created_at, last_login FROM users${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`
-        ).all(...params, limit, offset);
-
-        res.json({ users, total, page, limit, totalPages: Math.ceil(total / limit) });
-    } catch (err) {
-        console.error('Admin users error:', err);
-        res.status(500).json({ error: '获取用户列表失败' });
-    }
-});
-
-app.put('/api/admin/users/:id/credits', authenticateAdmin, (req, res) => {
-    try {
-        const userId = Number(req.params.id);
-        const credits = Number(req.body.download_credits);
-        if (!Number.isInteger(userId) || userId <= 0) {
-            return res.status(400).json({ error: '无效的用户 ID' });
-        }
-        if (!Number.isInteger(credits) || credits < 0) {
-            return res.status(400).json({ error: '下载次数必须是大于等于 0 的整数' });
-        }
-
-        const result = db.prepare('UPDATE users SET download_credits = ? WHERE id = ?').run(credits, userId);
-        if (result.changes === 0) {
-            return res.status(404).json({ error: '用户不存在' });
-        }
-
-        const user = db.prepare('SELECT id, username, download_credits, created_at, last_login FROM users WHERE id = ?').get(userId);
-        logOperation({
-            userType: 'admin',
-            userId: req.admin.id,
-            username: req.admin.username,
-            action: 'admin_update_user_credits',
-            targetType: 'user',
-            targetId: String(userId),
-            ip: req.ip,
-            details: { download_credits: credits, username: user?.username }
-        });
-
-        res.json({ success: true, user });
-    } catch (err) {
-        console.error('Admin update credits error:', err);
-        res.status(500).json({ error: '更新下载次数失败' });
-    }
-});
-
-app.post('/api/admin/users/:id/reset-password', authenticateAdmin, async (req, res) => {
-    try {
-        const userId = Number(req.params.id);
-        if (!Number.isInteger(userId) || userId <= 0) {
-            return res.status(400).json({ error: '无效的用户 ID' });
-        }
-
-        const user = db.prepare('SELECT id, username FROM users WHERE id = ?').get(userId);
-        if (!user) {
-            return res.status(404).json({ error: '用户不存在' });
-        }
-
-        const providedPassword = typeof req.body.newPassword === 'string' ? req.body.newPassword.trim() : '';
-        const temporaryPassword = providedPassword || crypto.randomBytes(6).toString('base64url');
-        if (temporaryPassword.length < 6) {
-            return res.status(400).json({ error: '新密码长度至少 6 位' });
-        }
-
-        const hash = await bcrypt.hash(temporaryPassword, 12);
-        db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, userId);
-        logOperation({
-            userType: 'admin',
-            userId: req.admin.id,
-            username: req.admin.username,
-            action: 'admin_reset_user_password',
-            targetType: 'user',
-            targetId: String(userId),
-            ip: req.ip,
-            details: { username: user.username }
-        });
-
-        res.json({
-            success: true,
-            username: user.username,
-            temporary_password: temporaryPassword,
-            message: '原密码无法从哈希中恢复，已重置为新的临时密码。'
-        });
-    } catch (err) {
-        console.error('Admin reset password error:', err);
-        res.status(500).json({ error: '重置密码失败' });
-    }
-});
-
-// ============== Visit Tracking ==============
-app.post('/api/track/visit', (req, res) => {
-    try {
-        const visitPath = req.body.path || '/';
-        const ip = req.ip;
-        const ua = (req.headers['user-agent'] || '').substring(0, 512);
-        db.prepare('INSERT INTO page_views (path, ip_address, user_agent, created_at) VALUES (?, ?, ?, ?)').run(visitPath, ip, ua, new Date().toISOString());
-        res.json({ success: true });
-    } catch (err) {
-        res.status(500).json({ error: '记录失败' });
-    }
-});
-
-app.get('/api/stats/visits', (req, res) => {
-    try {
-        const total = db.prepare('SELECT COUNT(*) as count FROM page_views').get().count;
-        res.json({ totalVisits: total });
-    } catch (err) {
-        res.status(500).json({ error: '获取访问量失败' });
-    }
-});
-
-// ============== SPA fallback ==============
-app.get('/admin', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'admin.html'));
-});
-
-app.get('/', (req, res) => {
-    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// ============== Initialize & Start ==============
-initDatabase();
-
-// Cleanup old login attempts every hour
-setInterval(cleanupLoginAttempts, 60 * 60 * 1000);
-setInterval(cleanupOldLogs, 24 * 60 * 60 * 1000);
-
-const server = app.listen(PORT, HOST, () => {
-    console.log(`[Server] RP Forum running at http://${HOST}:${PORT}`);
-    console.log(`[Server] Admin panel at http://${HOST}:${PORT}/admin`);
-});
-
-// Graceful shutdown for Docker
-function gracefulShutdown(signal) {
-    console.log(`[Server] ${signal} received, shutting down...`);
-    server.close(() => {
-        db.close();
-        console.log('[Server] Database closed, exiting.');
-        process.exit(0);
-    });
-    setTimeout(() => { process.exit(1); }, 5000);
-}
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
