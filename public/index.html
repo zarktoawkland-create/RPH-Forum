@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
@@ -2886,7 +2886,7 @@
                     if (!editingCard.value || isEditUploading.value) return;
                     isEditUploading.value = true;
                     try {
-                        const headers = isLoggedIn.value ? userAuthHeaders() : adminAuthHeaders();
+                        const headers = isAdmin.value ? adminAuthHeaders() : userAuthHeaders();
                         const editPayload = {
                             name: editingCard.value.name,
                             description: editingCard.value.description,
