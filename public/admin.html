@@ -89,6 +89,10 @@
                         <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"/></svg>
                         标签管理
                     </button>
+                    <button @click="currentPage = 'audit'; showMobileMenu = false; loadAuditPatterns()" :class="currentPage === 'audit' ? 'bg-gray-800 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'" class="w-full flex items-center px-4 py-3 rounded-xl transition text-left">
+                        <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+                        违禁词检测
+                    </button>
                     <button @click="currentPage = 'logs'; showMobileMenu = false; loadLogs()" :class="currentPage === 'logs' ? 'bg-gray-800 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'" class="w-full flex items-center px-4 py-3 rounded-xl transition text-left">
                         <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
                         操作日志
@@ -120,7 +124,7 @@
                             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
                         </button>
                         <h2 class="text-lg md:text-xl font-bold text-gray-900 truncate">
-                            {{ {dashboard:'仪表盘',cards:'卡片管理',comments:'评论管理',users:'用户管理',tags:'标签管理',logs:'操作日志',settings:'系统设置'}[currentPage] }}
+                            {{ {dashboard:'仪表盘',cards:'卡片管理',comments:'评论管理',users:'用户管理',tags:'标签管理',audit:'违禁词检测',logs:'操作日志',settings:'系统设置'}[currentPage] }}
                         </h2>
                     </div>
                     <a href="/" target="_blank" class="text-sm text-blue-600 hover:text-blue-800 transition whitespace-nowrap">查看前台 →</a>
@@ -597,7 +601,7 @@
                                     </div>
                                 </div>
                                 <div v-if="tagSettingsDirty" class="mt-3 rounded-2xl border border-amber-200 bg-white/70 px-4 py-3 text-sm text-amber-700">
-                                    当前修改仍在后台草稿中。点击“保存标签配置”后，前台热门标签和标签库才会应用这次变更。
+                                    当前修改仍在后台草稿中。点击"保存标签配置"后，前台热门标签和标签库才会应用这次变更。
                                 </div>
                             </div>
 
@@ -828,7 +832,7 @@
                                         </label>
                                     </div>
                                     <div class="rounded-2xl border border-dashed border-gray-300 bg-gray-50 p-4 text-sm text-gray-600">
-                                        热门标签和标签库已经单独放到左侧的“标签管理”页面，方便管理员直接维护。
+                                        热门标签和标签库已经单独放到左侧的"标签管理"页面，方便管理员直接维护。
                                     </div>
                                     <div class="flex flex-col gap-3 sm:flex-row sm:items-center">
                                         <button @click="saveSettings" :disabled="settingsSaving" class="bg-blue-600 text-white px-6 py-2 rounded-xl hover:bg-blue-700 transition text-sm font-medium disabled:opacity-60 disabled:cursor-not-allowed">
@@ -860,6 +864,161 @@
                                     <div v-if="passwordError" class="bg-red-50 text-red-600 text-sm p-3 rounded-xl">{{ passwordError }}</div>
                                     <div v-if="passwordSuccess" class="bg-green-50 text-green-600 text-sm p-3 rounded-xl">{{ passwordSuccess }}</div>
                                     <button @click="changePassword" class="bg-blue-600 text-white px-6 py-2 rounded-xl hover:bg-blue-700 transition text-sm font-medium">修改密码</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Audit Patterns -->
+                    <div v-if="currentPage === 'audit'">
+                        <div class="max-w-4xl space-y-6">
+                            <!-- Audit Toggle -->
+                            <div class="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                                    <div>
+                                        <h3 class="text-lg font-bold text-gray-900">内容审核</h3>
+                                        <p class="text-sm text-gray-500 mt-1">开启后，上传角色卡时将自动检测违禁词。命中违禁词的角色卡将被拒绝上传。</p>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <span class="text-sm" :class="auditEnabled === 'true' ? 'text-green-600 font-medium' : 'text-gray-400'">{{ auditEnabled === 'true' ? '已开启' : '已关闭' }}</span>
+                                        <button @click="auditEnabled = auditEnabled === 'true' ? 'false' : 'true'; siteSettings.audit_enabled = auditEnabled; saveSettings()"
+                                            :class="auditEnabled === 'true' ? 'bg-green-500 hover:bg-green-600' : 'bg-gray-300 hover:bg-gray-400'"
+                                            class="relative w-12 h-6 rounded-full transition-colors duration-200">
+                                            <span :class="auditEnabled === 'true' ? 'translate-x-6' : 'translate-x-1'" class="absolute top-1 left-0 w-4 h-4 bg-white rounded-full shadow transition-transform duration-200"></span>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Add Pattern Button -->
+                            <div class="flex items-center justify-between">
+                                <div>
+                                    <h3 class="text-lg font-bold text-gray-900">自定义违禁词</h3>
+                                    <p class="text-sm text-gray-500 mt-1">管理角色卡上传时的违禁词检测规则。系统内置了 XSS/注入攻击检测规则。</p>
+                                </div>
+                                <button @click="openAddAuditForm" class="bg-blue-600 text-white px-4 py-2 rounded-xl hover:bg-blue-700 transition text-sm font-medium flex items-center gap-2">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+                                    添加违禁词
+                                </button>
+                            </div>
+
+                            <!-- Patterns List -->
+                            <div v-if="auditLoading" class="text-center py-12 text-gray-400">
+                                <svg class="w-8 h-8 mx-auto mb-3 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"/></svg>
+                                加载中...
+                            </div>
+
+                            <div v-else-if="auditPatterns.length === 0" class="bg-white rounded-2xl shadow-sm border border-gray-100 p-12 text-center">
+                                <svg class="w-12 h-12 mx-auto mb-4 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+                                <p class="text-gray-500">暂无自定义违禁词</p>
+                                <p class="text-sm text-gray-400 mt-1">点击上方「添加违禁词」按钮来添加检测规则</p>
+                            </div>
+
+                            <div v-else class="space-y-3">
+                                <div v-for="p in auditPatterns" :key="p.id"
+                                    class="bg-white rounded-2xl shadow-sm border border-gray-100 p-4 sm:p-5 transition hover:shadow-md"
+                                    :class="{ 'opacity-50': !p.enabled }">
+                                    <div class="flex flex-col sm:flex-row sm:items-start gap-3">
+                                        <!-- Toggle -->
+                                        <button @click="toggleAuditPattern(p)" class="mt-0.5 flex-shrink-0" :title="p.enabled ? '点击禁用' : '点击启用'">
+                                            <span :class="p.enabled ? 'bg-green-500' : 'bg-gray-300'" class="block w-10 h-5 rounded-full relative transition-colors">
+                                                <span :class="p.enabled ? 'translate-x-5' : 'translate-x-0.5'" class="absolute top-0.5 left-0 w-4 h-4 bg-white rounded-full shadow transition-transform"></span>
+                                            </span>
+                                        </button>
+
+                                        <!-- Content -->
+                                        <div class="flex-1 min-w-0">
+                                            <div class="flex flex-wrap items-center gap-2 mb-2">
+                                                <code class="bg-gray-100 text-gray-800 px-2 py-0.5 rounded text-sm font-mono break-all">{{ p.pattern }}</code>
+                                                <span :class="getSeverityColor(p.severity)" class="text-xs px-2 py-0.5 rounded-full font-medium">{{ getSeverityLabel(p.severity) }}</span>
+                                                <span class="bg-blue-50 text-blue-600 text-xs px-2 py-0.5 rounded-full">{{ getPatternTypeLabel(p.pattern_type) }}</span>
+                                            </div>
+                                            <p v-if="p.description" class="text-sm text-gray-500">{{ p.description }}</p>
+                                            <p class="text-xs text-gray-400 mt-1">ID: {{ p.id }} · 创建于 {{ formatDate(p.created_at) }}</p>
+                                        </div>
+
+                                        <!-- Actions -->
+                                        <div class="flex items-center gap-2 flex-shrink-0">
+                                            <button @click="openEditAuditForm(p)" class="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition" title="编辑">
+                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+                                            </button>
+                                            <button @click="deleteAuditPattern(p)" class="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition" title="删除">
+                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Add/Edit Pattern Modal -->
+                        <div v-if="auditForm.show" class="fixed inset-0 z-50 flex items-center justify-center p-4">
+                            <div class="absolute inset-0 bg-black/40" @click="closeAuditForm"></div>
+                            <div class="relative bg-white rounded-2xl shadow-xl w-full max-w-lg max-h-[90vh] overflow-auto">
+                                <div class="p-6">
+                                    <div class="flex items-center justify-between mb-6">
+                                        <h3 class="text-lg font-bold text-gray-900">{{ auditForm.editingId ? '编辑违禁词' : '添加违禁词' }}</h3>
+                                        <button @click="closeAuditForm" class="p-1 text-gray-400 hover:text-gray-600 transition">
+                                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                                        </button>
+                                    </div>
+
+                                    <div class="space-y-4">
+                                        <!-- Pattern -->
+                                        <div>
+                                            <label class="block text-sm font-medium text-gray-700 mb-1">正则表达式 <span class="text-red-500">*</span></label>
+                                            <input v-model="auditForm.pattern" type="text" placeholder="例如：违禁词1|违禁词2|违禁词3"
+                                                class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none font-mono text-sm">
+                                            <p class="text-xs text-gray-400 mt-1">支持 JavaScript 正则语法，匹配时忽略大小写。多个词用 | 分隔。</p>
+                                        </div>
+
+                                        <!-- Type & Severity -->
+                                        <div class="grid grid-cols-2 gap-4">
+                                            <div>
+                                                <label class="block text-sm font-medium text-gray-700 mb-1">类型</label>
+                                                <select v-model="auditForm.pattern_type" class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm">
+                                                    <option value="custom">自定义</option>
+                                                    <option value="content">内容过滤</option>
+                                                    <option value="xss">XSS防护</option>
+                                                    <option value="injection">注入防护</option>
+                                                    <option value="url">URL防护</option>
+                                                </select>
+                                            </div>
+                                            <div>
+                                                <label class="block text-sm font-medium text-gray-700 mb-1">严重程度</label>
+                                                <select v-model="auditForm.severity" class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm">
+                                                    <option value="low">低</option>
+                                                    <option value="medium">中</option>
+                                                    <option value="high">高</option>
+                                                    <option value="critical">严重</option>
+                                                </select>
+                                            </div>
+                                        </div>
+
+                                        <!-- Description -->
+                                        <div>
+                                            <label class="block text-sm font-medium text-gray-700 mb-1">描述</label>
+                                            <input v-model="auditForm.description" type="text" placeholder="可选，简要说明该规则的用途"
+                                                class="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm">
+                                        </div>
+
+                                        <!-- Test Preview -->
+                                        <div v-if="auditForm.pattern" class="rounded-xl bg-gray-50 border border-gray-200 p-3">
+                                            <p class="text-xs text-gray-500 mb-1">正则预览</p>
+                                            <code class="text-xs text-gray-600 break-all">{{ auditForm.pattern }}</code>
+                                            <p v-if="isValidAuditRegex" class="text-xs text-green-600 mt-1">✓ 正则语法有效</p>
+                                            <p v-else class="text-xs text-red-600 mt-1">✗ 正则语法无效</p>
+                                        </div>
+                                    </div>
+
+                                    <!-- Actions -->
+                                    <div class="flex justify-end gap-3 mt-6">
+                                        <button @click="closeAuditForm" class="px-4 py-2 rounded-xl border border-gray-300 text-sm font-medium text-gray-700 hover:bg-gray-50 transition">取消</button>
+                                        <button @click="saveAuditPattern" :disabled="auditForm.saving || !auditForm.pattern.trim()"
+                                            class="px-4 py-2 rounded-xl bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 transition disabled:opacity-60 disabled:cursor-not-allowed">
+                                            {{ auditForm.saving ? '保存中...' : '保存' }}
+                                        </button>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -1046,6 +1205,25 @@
                 const passwordForm = reactive({ currentPassword: '', newPassword: '', confirmPassword: '' });
                 const passwordError = ref('');
                 const passwordSuccess = ref('');
+
+                // Audit / Prohibited Patterns
+                const auditPatterns = ref([]);
+                const auditLoading = ref(false);
+                const auditForm = reactive({
+                    show: false,
+                    editingId: null,
+                    pattern: '',
+                    pattern_type: 'custom',
+                    severity: 'medium',
+                    description: '',
+                    saving: false
+                });
+                const auditEnabled = ref('false');
+                const auditStrictMode = ref('false');
+                const isValidAuditRegex = computed(() => {
+                    try { new RegExp(auditForm.pattern, 'gi'); return true; }
+                    catch (e) { return false; }
+                });
 
                 function authHeaders() {
                     return { 'Authorization': 'Bearer ' + token.value, 'Content-Type': 'application/json' };
@@ -1554,6 +1732,8 @@
                         if (settingsResp.ok) {
                             const data = await settingsResp.json();
                             Object.assign(siteSettings, data);
+                            auditEnabled.value = data.audit_enabled || 'false';
+                            auditStrictMode.value = data.audit_strict_mode || 'false';
                             syncTagEditorFromSettings();
                             captureSavedTagSnapshot();
                         }
@@ -1614,6 +1794,158 @@
                     }
                 }
 
+                // ============== Audit Pattern Methods ==============
+                async function loadAuditPatterns() {
+                    auditLoading.value = true;
+                    try {
+                        const resp = await fetch(API_BASE + '/api/admin/audit-patterns', { headers: authHeaders() });
+                        if (resp.ok) {
+                            const data = await resp.json();
+                            auditPatterns.value = data.patterns || [];
+                        }
+                    } catch (err) {
+                        console.error('Audit patterns error:', err);
+                        showToast('加载违禁词列表失败', 'error');
+                    } finally {
+                        auditLoading.value = false;
+                    }
+                }
+
+                function openAddAuditForm() {
+                    auditForm.show = true;
+                    auditForm.editingId = null;
+                    auditForm.pattern = '';
+                    auditForm.pattern_type = 'custom';
+                    auditForm.severity = 'medium';
+                    auditForm.description = '';
+                }
+
+                function openEditAuditForm(p) {
+                    auditForm.show = true;
+                    auditForm.editingId = p.id;
+                    auditForm.pattern = p.pattern || '';
+                    auditForm.pattern_type = p.pattern_type || 'custom';
+                    auditForm.severity = p.severity || 'medium';
+                    auditForm.description = p.description || '';
+                }
+
+                function closeAuditForm() {
+                    auditForm.show = false;
+                    auditForm.editingId = null;
+                }
+
+                async function saveAuditPattern() {
+                    const pattern = (auditForm.pattern || '').trim();
+                    if (!pattern) {
+                        showToast('违禁词正则不能为空', 'warning');
+                        return;
+                    }
+                    // Validate regex
+                    try {
+                        new RegExp(pattern, 'gi');
+                    } catch (e) {
+                        showToast('无效的正则表达式: ' + e.message, 'error');
+                        return;
+                    }
+
+                    auditForm.saving = true;
+                    try {
+                        let resp;
+                        if (auditForm.editingId) {
+                            // Update
+                            resp = await fetch(API_BASE + '/api/admin/audit-patterns/' + auditForm.editingId, {
+                                method: 'PUT',
+                                headers: authHeaders(),
+                                body: JSON.stringify({
+                                    pattern,
+                                    pattern_type: auditForm.pattern_type,
+                                    severity: auditForm.severity,
+                                    description: auditForm.description
+                                })
+                            });
+                        } else {
+                            // Create
+                            resp = await fetch(API_BASE + '/api/admin/audit-patterns', {
+                                method: 'POST',
+                                headers: authHeaders(),
+                                body: JSON.stringify({
+                                    pattern,
+                                    pattern_type: auditForm.pattern_type,
+                                    severity: auditForm.severity,
+                                    description: auditForm.description
+                                })
+                            });
+                        }
+                        const data = await resp.json().catch(() => ({}));
+                        if (!resp.ok) {
+                            throw new Error(data.error || '操作失败');
+                        }
+                        showToast(auditForm.editingId ? '违禁词已更新' : '违禁词已添加', 'success');
+                        closeAuditForm();
+                        loadAuditPatterns();
+                    } catch (err) {
+                        showToast(err.message || '保存失败', 'error');
+                    } finally {
+                        auditForm.saving = false;
+                    }
+                }
+
+                async function deleteAuditPattern(p) {
+                    if (!confirm('确定删除违禁词 "' + p.pattern + '" 吗？')) return;
+                    try {
+                        const resp = await fetch(API_BASE + '/api/admin/audit-patterns/' + p.id, {
+                            method: 'DELETE',
+                            headers: authHeaders()
+                        });
+                        const data = await resp.json().catch(() => ({}));
+                        if (!resp.ok) {
+                            throw new Error(data.error || '删除失败');
+                        }
+                        showToast('违禁词已删除', 'success');
+                        loadAuditPatterns();
+                    } catch (err) {
+                        showToast(err.message || '删除失败', 'error');
+                    }
+                }
+
+                async function toggleAuditPattern(p) {
+                    try {
+                        const resp = await fetch(API_BASE + '/api/admin/audit-patterns/' + p.id, {
+                            method: 'PUT',
+                            headers: authHeaders(),
+                            body: JSON.stringify({ enabled: p.enabled ? 0 : 1 })
+                        });
+                        if (resp.ok) {
+                            showToast(p.enabled ? '违禁词已禁用' : '违禁词已启用', 'success');
+                            loadAuditPatterns();
+                        }
+                    } catch (err) {
+                        showToast('操作失败', 'error');
+                    }
+                }
+
+                function getSeverityLabel(severity) {
+                    const map = { low: '低', medium: '中', high: '高', critical: '严重' };
+                    return map[severity] || severity;
+                }
+
+                function getSeverityColor(severity) {
+                    const map = { low: 'bg-gray-100 text-gray-700', medium: 'bg-yellow-100 text-yellow-700', high: 'bg-orange-100 text-orange-700', critical: 'bg-red-100 text-red-700' };
+                    return map[severity] || 'bg-gray-100 text-gray-700';
+                }
+
+                function getPatternTypeLabel(type) {
+                    const map = { custom: '自定义', xss: 'XSS防护', injection: '注入防护', url: 'URL防护', content: '内容过滤' };
+                    return map[type] || type;
+                }
+
+                function isBuiltInPattern(p) {
+                    // Built-in patterns are identified by having no id from the custom table,
+                    // but since all patterns now come from the DB, we can check if the pattern_type is not 'custom'
+                    // Actually, built-in patterns are hardcoded in server.js, not in DB
+                    return false;
+                }
+
                 onMounted(() => {
                     checkAuth();
                 });
@@ -1632,7 +1964,10 @@
                     handleConfiguredTagClick, handleHiddenTagClick, handlePreviewTagClick,
                     toggleBatchPanel, clearBatchDraft, applyBatchTags, clearConfiguredTags, restoreHiddenTag, clearHiddenTags,
                     restoreSavedTagSnapshot, loadSettings, saveSettings,
-                    passwordForm, passwordError, passwordSuccess, changePassword
+                    passwordForm, passwordError, passwordSuccess, changePassword,
+                    auditPatterns, auditLoading, auditForm, auditEnabled, auditStrictMode, isValidAuditRegex,
+                    loadAuditPatterns, openAddAuditForm, openEditAuditForm, closeAuditForm, saveAuditPattern,
+                    deleteAuditPattern, toggleAuditPattern, getSeverityLabel, getSeverityColor, getPatternTypeLabel
                 };
             }
         }).mount('#admin-app');
