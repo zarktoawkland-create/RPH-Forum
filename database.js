@@ -126,6 +126,17 @@ function initDatabase() {
         CREATE INDEX IF NOT EXISTS idx_operation_logs_created_at ON operation_logs(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_operation_logs_action ON operation_logs(action);
         CREATE INDEX IF NOT EXISTS idx_page_views_created_at ON page_views(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS prohibited_patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern TEXT NOT NULL,
+            pattern_type TEXT NOT NULL DEFAULT 'custom',
+            severity TEXT NOT NULL DEFAULT 'medium',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            description TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
     `);
 
     // Migration: add columns if they don't exist (for existing databases)
@@ -138,6 +149,8 @@ function initDatabase() {
     try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_data_hash_unique ON character_cards (data_hash) WHERE data_hash IS NOT NULL'); } catch (e) { /* index exists */ }
     try { db.exec('ALTER TABLE character_comments ADD COLUMN reply_to_id TEXT'); } catch (e) { /* column exists */ }
     try { db.exec('ALTER TABLE character_comments ADD COLUMN reply_to_name TEXT'); } catch (e) { /* column exists */ }
+    try { db.exec('ALTER TABLE prohibited_patterns ADD COLUMN description TEXT'); } catch (e) { /* column exists */ }
+    try { db.exec('ALTER TABLE prohibited_patterns ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP'); } catch (e) { /* column exists */ }
 
     // Seed admin user from environment variables
     const adminUsername = process.env.ADMIN_USERNAME || 'admin';
@@ -167,7 +180,9 @@ function initDatabase() {
         popular_tags: '',
         tag_library: '',
         hidden_popular_tags: '',
-        hidden_tag_library: ''
+        hidden_tag_library: '',
+        audit_enabled: 'false',
+        audit_strict_mode: 'false'
     };
     const upsertSetting = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
     for (const [key, value] of Object.entries(defaultSettings)) {

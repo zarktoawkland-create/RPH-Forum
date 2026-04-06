@@ -165,6 +165,208 @@ function logOperation({ userType, userId, username, action, targetType, targetId
     }
 }
 
+// ============== Character Card Audit System ==============
+
+/**
+ * 违禁词检测正则列表
+ * 可根据需要添加更多规则
+ */
+const PROHIBITED_PATTERNS = [
+    // XSS/注入攻击
+    { pattern: /<script[\s\S]*?<\/script>/gi, type: 'XSS脚本注入', severity: 'high' },
+    { pattern: /javascript:/gi, type: 'JavaScript协议', severity: 'high' },
+    { pattern: /on\w+\s*=/gi, type: '事件处理器注入', severity: 'high' },
+    { pattern: /<iframe[\s\S]*?>/gi, type: 'iframe注入', severity: 'high' },
+    { pattern: /<object[\s\S]*?>/gi, type: '对象注入', severity: 'high' },
+    { pattern: /<embed[\s\S]*?>/gi, type: '嵌入内容注入', severity: 'high' },
+
+    // 数据URL协议
+    { pattern: /data:\s*text\/html/gi, type: 'DataURL注入', severity: 'high' },
+    { pattern: /data:\s*image\/svg\+xml/gi, type: 'SVG注入', severity: 'medium' },
+
+    // 协议伪装的链接
+    { pattern: /href\s*=\s*["']?\s*javascript:/gi, type: 'JavaScript链接', severity: 'high' },
+    { pattern: /src\s*=\s*["']?\s*javascript:/gi, type: 'JavaScript源', severity: 'high' },
+];
+
+/**
+ * 从数据库获取已启用的自定义违禁词
+ * @returns {Array<{pattern: string, type: string, severity: string}>}
+ */
+function getCustomPatterns() {
+    try {
+        const rows = db.prepare('SELECT pattern, pattern_type, severity, description FROM prohibited_patterns WHERE enabled = 1').all();
+        return rows.map(row => {
+            let regex;
+            try {
+                regex = new RegExp(row.pattern, 'gi');
+            } catch (e) {
+                regex = null; // Invalid regex will be skipped
+            }
+            return {
+                pattern: regex,
+                rawPattern: row.pattern,
+                type: row.pattern_type || 'custom',
+                severity: row.severity || 'medium',
+                description: row.description || ''
+            };
+        }).filter(p => p.pattern !== null);
+    } catch (e) {
+        console.error('[Audit] Failed to load custom patterns:', e);
+        return [];
+    }
+}
+
+/**
+ * 获取审核功能开关状态
+ */
+function isAuditEnabled() {
+    try {
+        const setting = db.prepare("SELECT value FROM settings WHERE key = 'audit_enabled'").get();
+        return setting && setting.value === 'true';
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
+ * 提取角色卡中所有需要审核的文本字段
+ * @param {Object} cardData - 角色卡数据对象
+ * @returns {Array<{field: string, value: string}>}
+ */
+function extractCharacterCardText(cardData) {
+    const fields = [];
+
+    // 处理 V2 格式 (SillyTavern)
+    const charData = cardData.data || cardData;
+
+    // 核心文本字段映射
+    const textFieldPaths = [
+        { key: 'name', alt: 'char_name' },
+        { key: 'description', alt: 'char_persona' },
+        { key: 'personality' },
+        { key: 'scenario' },
+        { key: 'first_mes' },
+        { key: 'mes_example' },
+        { key: 'creator_notes', alt: 'creatorcomment', alt2: 'creator_comment' },
+        { key: 'creator' },
+        { key: 'character_version' },
+        { key: 'system_prompt' },
+        { key: 'post_history_instructions' },
+    ];
+
+    textFieldPaths.forEach(({ key, alt, alt2 }) => {
+        let value = charData[key];
+        if (!value && alt) value = charData[alt];
+        if (!value && alt2) value = charData[alt2];
+        if (value !== undefined && value !== null) {
+            fields.push({ field: key, value: String(value) });
+        }
+    });
+
+    // alternate_greetings 数组
+    if (Array.isArray(charData.alternate_greetings)) {
+        charData.alternate_greetings.forEach((v, i) => {
+            if (v !== undefined && v !== null) {
+                fields.push({ field: `alternate_greetings[${i}]`, value: String(v) });
+            }
+        });
+    }
+
+    // tags 数组
+    if (Array.isArray(charData.tags)) {
+        charData.tags.forEach((v, i) => {
+            if (v !== undefined && v !== null) {
+                fields.push({ field: `tags[${i}]`, value: String(v) });
+            }
+        });
+    }
+
+    // 世界书 (character_book) 条目
+    const characterBook = charData.character_book;
+    if (characterBook) {
+        let entries = characterBook.entries;
+        // 支持对象格式的 entries
+        if (!Array.isArray(entries) && typeof entries === 'object' && entries !== null) {
+            entries = Object.values(entries);
+        }
+        if (Array.isArray(entries)) {
+            entries.forEach((entry, i) => {
+                if (entry && typeof entry === 'object') {
+                    // content 字段（最重要）
+                    if (entry.content !== undefined && entry.content !== null) {
+                        fields.push({ field: `character_book.entries[${i}].content`, value: String(entry.content) });
+                    }
+                    // name 字段
+                    if (entry.name !== undefined && entry.name !== null) {
+                        fields.push({ field: `character_book.entries[${i}].name`, value: String(entry.name) });
+                    }
+                    // description 字段
+                    if (entry.description !== undefined && entry.description !== null) {
+                        fields.push({ field: `character_book.entries[${i}].description`, value: String(entry.description) });
+                    }
+                    // keys 数组
+                    if (Array.isArray(entry.keys)) {
+                        entry.keys.forEach((k, j) => {
+                            if (k !== undefined && k !== null) {
+                                fields.push({ field: `character_book.entries[${i}].keys[${j}]`, value: String(k) });
+                            }
+                        });
+                    }
+                    // secondary_keys 数组
+                    if (Array.isArray(entry.secondary_keys)) {
+                        entry.secondary_keys.forEach((k, j) => {
+                            if (k !== undefined && k !== null) {
+                                fields.push({ field: `character_book.entries[${i}].secondary_keys[${j}]`, value: String(k) });
+                            }
+                        });
+                    }
+                    // extensions 中的 content (部分导出格式)
+                    if (entry.extensions && entry.extensions.content) {
+                        fields.push({ field: `character_book.entries[${i}].extensions.content`, value: String(entry.extensions.content) });
+                    }
+                }
+            });
+        }
+    }
+
+    return fields;
+}
+
+/**
+ * 审核角色卡内容
+ * @param {Object} cardData - 角色卡数据对象
+ * @returns {Array<{field: string, type: string, matches: string[], count: number}>} 违规列表
+ */
+function auditCharacterCard(cardData) {
+    const violations = [];
+    const fields = extractCharacterCardText(cardData);
+
+    // 合并内置规则和自定义规则
+    const allPatterns = [...PROHIBITED_PATTERNS, ...getCustomPatterns()];
+
+    fields.forEach(({ field, value }) => {
+        allPatterns.forEach(({ pattern, type, severity }) => {
+            try {
+                const matches = value.match(pattern);
+                if (matches) {
+                    violations.push({
+                        field,
+                        type,
+                        severity,
+                        matches: matches.slice(0, 5), // 最多5个示例
+                        count: matches.length
+                    });
+                }
+            } catch (e) {
+                // 正则错误时跳过
+            }
+        });
+    });
+
+    return violations;
+}
+
 // ============== Brute Force Protection ==============
 function checkBruteForce(ip, username) {
     const cutoff = new Date(Date.now() - LOGIN_WINDOW_MINUTES * 60 * 1000).toISOString();
@@ -733,6 +935,31 @@ app.post('/api/cards', requireUserOrAdmin, (req, res) => {
         if (!name) {
             return res.status(400).json({ error: '卡片名称不能为空' });
         }
+
+        // === 角色卡内容审核 (仅当审核功能开启时) ===
+        if (isAuditEnabled() && data) {
+            const violations = auditCharacterCard(data);
+            if (violations.length > 0) {
+                console.warn(`[Audit] Card upload rejected for user ${req.user?.username || req.admin?.username}:`, violations.map(v => `${v.field}: ${v.type}`));
+
+                // 记录审核拒绝日志
+                logOperation({
+                    userType: req.user ? 'user' : 'admin',
+                    userId: req.user?.id || req.admin?.id,
+                    username: req.user?.username || req.admin?.username,
+                    action: 'upload_rejected',
+                    targetType: 'card',
+                    ip: req.ip,
+                    details: { reason: 'prohibited_content', violations: violations.map(v => ({ field: v.field, type: v.type, severity: v.severity })) }
+                });
+
+                return res.status(400).json({
+                    error: '角色卡包含违规内容，无法上传',
+                    details: '检测到以下违规内容：' + violations.map(v => `${v.type}(${v.field})`).join('、')
+                });
+            }
+        }
+        // === 审核结束 ===
 
         // Duplicate detection via stable hash of card data (atomic via UNIQUE index)
         const dataHash = hashCardData(data);
@@ -1358,7 +1585,8 @@ const ALLOWED_SETTINGS_KEYS = new Set([
     'site_name', 'site_description', 'allow_anonymous_upload',
     'allow_anonymous_comment', 'max_upload_size_mb',
     'popular_tags', 'tag_library',
-    'hidden_popular_tags', 'hidden_tag_library'
+    'hidden_popular_tags', 'hidden_tag_library',
+    'audit_enabled', 'audit_strict_mode'
 ]);
 
 const TAG_SETTING_KEYS = new Set([
@@ -1398,12 +1626,14 @@ function validateTagSettingValue(key, value) {
 app.put('/api/admin/settings', authenticateAdmin, (req, res) => {
     try {
         const updates = req.body;
+        // Validate tag settings only
         for (const [key, value] of Object.entries(updates)) {
             if (!ALLOWED_SETTINGS_KEYS.has(key)) continue;
-            if (!TAG_SETTING_KEYS.has(key)) continue;
-            const error = validateTagSettingValue(key, value);
-            if (error) {
-                return res.status(400).json({ error });
+            if (TAG_SETTING_KEYS.has(key)) {
+                const error = validateTagSettingValue(key, value);
+                if (error) {
+                    return res.status(400).json({ error });
+                }
             }
         }
         const stmt = db.prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)');
@@ -1424,12 +1654,161 @@ app.put('/api/admin/settings', authenticateAdmin, (req, res) => {
                 popular_tags_count: parseTagSettingValue(updates.popular_tags).length,
                 tag_library_count: parseTagSettingValue(updates.tag_library).length,
                 hidden_popular_tags_count: parseTagSettingValue(updates.hidden_popular_tags).length,
-                hidden_tag_library_count: parseTagSettingValue(updates.hidden_tag_library).length
+                hidden_tag_library_count: parseTagSettingValue(updates.hidden_tag_library).length,
+                audit_enabled: updates.audit_enabled || undefined,
+                audit_strict_mode: updates.audit_strict_mode || undefined
             }
         });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: '更新设置失败' });
+    }
+});
+
+// ============== Prohibited Patterns Management ==============
+app.get('/api/admin/audit-patterns', authenticateAdmin, (req, res) => {
+    try {
+        const patterns = db.prepare('SELECT * FROM prohibited_patterns ORDER BY created_at DESC').all();
+        res.json({ patterns });
+    } catch (err) {
+        console.error('[Admin] Failed to get audit patterns:', err);
+        res.status(500).json({ error: '获取违禁词列表失败' });
+    }
+});
+
+app.post('/api/admin/audit-patterns', authenticateAdmin, (req, res) => {
+    try {
+        const { pattern, pattern_type, severity, description } = req.body;
+        if (!pattern) {
+            return res.status(400).json({ error: '违禁词正则不能为空' });
+        }
+
+        // 验证正则是否合法
+        try {
+            new RegExp(pattern, 'gi');
+        } catch (e) {
+            return res.status(400).json({ error: '无效的正则表达式' });
+        }
+
+        const validTypes = ['custom', 'xss', 'injection', 'url', 'content'];
+        const validSeverities = ['low', 'medium', 'high', 'critical'];
+
+        const stmt = db.prepare(
+            'INSERT INTO prohibited_patterns (pattern, pattern_type, severity, description) VALUES (?, ?, ?, ?)'
+        );
+        const result = stmt.run(
+            pattern,
+            validTypes.includes(pattern_type) ? pattern_type : 'custom',
+            validSeverities.includes(severity) ? severity : 'medium',
+            description || ''
+        );
+
+        const newPattern = db.prepare('SELECT * FROM prohibited_patterns WHERE id = ?').get(result.lastInsertRowid);
+
+        logOperation({
+            userType: 'admin',
+            userId: req.admin.id,
+            username: req.admin.username,
+            action: 'create_audit_pattern',
+            targetType: 'audit_pattern',
+            targetId: String(result.lastInsertRowid),
+            ip: req.ip,
+            details: { pattern, pattern_type, severity }
+        });
+
+        res.json({ success: true, pattern: newPattern });
+    } catch (err) {
+        console.error('[Admin] Failed to create audit pattern:', err);
+        res.status(500).json({ error: '添加违禁词失败' });
+    }
+});
+
+app.put('/api/admin/audit-patterns/:id', authenticateAdmin, (req, res) => {
+    try {
+        const { id } = req.params;
+        const { pattern, pattern_type, severity, description, enabled } = req.body;
+
+        const existing = db.prepare('SELECT * FROM prohibited_patterns WHERE id = ?').get(id);
+        if (!existing) {
+            return res.status(404).json({ error: '违禁词不存在' });
+        }
+
+        // 验证正则是否合法
+        if (pattern) {
+            try {
+                new RegExp(pattern, 'gi');
+            } catch (e) {
+                return res.status(400).json({ error: '无效的正则表达式' });
+            }
+        }
+
+        const validTypes = ['custom', 'xss', 'injection', 'url', 'content'];
+        const validSeverities = ['low', 'medium', 'high', 'critical'];
+
+        db.prepare(
+            `UPDATE prohibited_patterns SET
+                pattern = COALESCE(?, pattern),
+                pattern_type = COALESCE(?, pattern_type),
+                severity = COALESCE(?, severity),
+                description = COALESCE(?, description),
+                enabled = COALESCE(?, enabled),
+                updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?`
+        ).run(
+            pattern || null,
+            pattern_type && validTypes.includes(pattern_type) ? pattern_type : null,
+            severity && validSeverities.includes(severity) ? severity : null,
+            description !== undefined ? description : null,
+            enabled !== undefined ? (enabled ? 1 : 0) : null,
+            id
+        );
+
+        const updated = db.prepare('SELECT * FROM prohibited_patterns WHERE id = ?').get(id);
+
+        logOperation({
+            userType: 'admin',
+            userId: req.admin.id,
+            username: req.admin.username,
+            action: 'update_audit_pattern',
+            targetType: 'audit_pattern',
+            targetId: id,
+            ip: req.ip,
+            details: { pattern, pattern_type, severity, enabled }
+        });
+
+        res.json({ success: true, pattern: updated });
+    } catch (err) {
+        console.error('[Admin] Failed to update audit pattern:', err);
+        res.status(500).json({ error: '更新违禁词失败' });
+    }
+});
+
+app.delete('/api/admin/audit-patterns/:id', authenticateAdmin, (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const existing = db.prepare('SELECT * FROM prohibited_patterns WHERE id = ?').get(id);
+        if (!existing) {
+            return res.status(404).json({ error: '违禁词不存在' });
+        }
+
+        db.prepare('DELETE FROM prohibited_patterns WHERE id = ?').run(id);
+
+        logOperation({
+            userType: 'admin',
+            userId: req.admin.id,
+            username: req.admin.username,
+            action: 'delete_audit_pattern',
+            targetType: 'audit_pattern',
+            targetId: id,
+            ip: req.ip,
+            details: { pattern: existing.pattern, pattern_type: existing.pattern_type }
+        });
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[Admin] Failed to delete audit pattern:', err);
+        res.status(500).json({ error: '删除违禁词失败' });
     }
 });
 

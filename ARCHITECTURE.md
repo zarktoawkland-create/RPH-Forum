@@ -672,3 +672,67 @@ const likeTransaction = db.transaction((commentId, userId) => {
 8. **Phase 8 — 前端用户系统** → 登录/注册弹窗、token 管理、积分显示迁移
 9. **Phase 9 — 前端评论点赞** → 点赞按钮、热评标签
 10. **Phase 10 — 清理** → 移除 localStorage 中 `download_credits` 的旧逻辑
+
+---
+
+## 12. 角色卡内容审核系统 (2026-04-06 已实现)
+
+> 状态：✅ 已完成
+> 参考实现：D:\github\RP-Hub\assets\js\app.js (SillyTavern 角色卡解析)
+
+### 12.1 审核范围
+
+上传角色卡时，自动解析 PNG/JSON 文件中的角色数据，检查是否包含违规内容：
+
+| 格式 | 解析方式 |
+|------|----------|
+| `.png` | 读取 PNG tEXt/iTXt chunk 中的 `chara` 字段 |
+| `.json` | 直接 JSON.parse() |
+
+### 12.2 审核字段
+
+- **核心字段**：`name`, `description`, `personality`, `scenario`, `first_mes`, `mes_example`
+- **创作者信息**：`creator_notes`, `creator`, `system_prompt`, `post_history_instructions`
+- **数组字段**：`alternate_greetings[]`, `tags[]`
+- **世界书条目**：`character_book.entries[].content`, `.keys`, `.name`
+
+### 12.3 违规检测类型
+
+| 类型 | 示例 | 严重度 |
+|------|------|--------|
+| XSS 脚本注入 | `<script>...</script>` | 高 |
+| JavaScript 协议 | `javascript:alert()` | 高 |
+| 事件处理器注入 | `onclick=`, `onerror=` | 高 |
+| iframe 注入 | `<iframe src=...>` | 高 |
+| DataURL 注入 | `data:text/html;...` | 高 |
+| SVG 注入 | `data:image/svg+xml;...` | 中 |
+
+### 12.4 实现位置
+
+**文件：** `server.js`
+
+```
+新增函数:
+├── extractCharacterCardText()     # 提取所有审核字段
+├── auditCharacterCard()           # 审核角色卡内容
+└── PROHIBITED_PATTERNS[]          # 违禁词正则列表
+
+修改路由:
+└── POST /api/cards               # 添加审核检查逻辑
+```
+
+### 12.5 审核流程
+
+```
+用户上传角色卡 (POST /api/cards)
+    ↓
+解析 data 字段（SillyTavern 格式支持 V1/V2）
+    ↓
+提取所有文本字段
+    ↓
+遍历违禁词正则检测
+    ↓
+发现违规内容？
+    ├─ 是 → 返回 400 错误，记录日志，拒绝上传
+    └─ 否 → 继续原有逻辑（重复检测 → 入库）
+```
